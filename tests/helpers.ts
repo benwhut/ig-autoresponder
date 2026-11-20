@@ -9,7 +9,9 @@ import type { Env, Rule } from "../src/types";
 import { D1Sqlite } from "./d1";
 
 export const ACCOUNT_ID = "17841400000000001";
-export const TEST_TOKEN = "IGQVJ-test-token-value";
+export const FACEBOOK_ACCOUNT_ID = "17841400000000002";
+export const TEST_TOKEN = "IGAA-test-token-value";
+export const FACEBOOK_TOKEN = "EAA-test-token-value";
 export const APP_SECRET = "test-app-secret";
 export const VERIFY_TOKEN = "test-verify-token";
 export const ADMIN_PASSWORD = "test-admin-password";
@@ -73,7 +75,11 @@ export async function createTestContext(
   };
 
   if (options.withAccount !== false) {
-    await saveAccount(env, { user_id: ACCOUNT_ID, username: "testaccount" });
+    await saveAccount(env, {
+      user_id: ACCOUNT_ID,
+      username: "testaccount",
+      token_type: "instagram_graph",
+    });
   }
   if (options.withToken !== false) {
     await saveToken(env, TEST_TOKEN);
@@ -342,7 +348,28 @@ export function installMetaMock(
     if (call.path === "/refresh_access_token") {
       return jsonResponse({ access_token: "refreshed-token", expires_in: 5_184_000 });
     }
-    if (call.path.endsWith("/me/media")) {
+    if (call.path.endsWith("/debug_token")) {
+      return jsonResponse({ data: { expires_at: 0, is_valid: true } });
+    }
+    if (call.path.endsWith("/me/assigned_instagram_accounts")) {
+      return jsonResponse({
+        data: [{ id: FACEBOOK_ACCOUNT_ID, username: "businessaccount" }],
+      });
+    }
+    if (call.path.endsWith("/me/accounts")) {
+      return jsonResponse({
+        data: [
+          {
+            id: "page_1",
+            instagram_business_account: {
+              id: FACEBOOK_ACCOUNT_ID,
+              username: "businessaccount",
+            },
+          },
+        ],
+      });
+    }
+    if (call.path.endsWith("/media")) {
       return jsonResponse({
         data: [
           {
@@ -365,7 +392,7 @@ export function installMetaMock(
         ],
       });
     }
-    if (call.path.endsWith("/me/messages")) {
+    if (call.path.endsWith("/messages")) {
       return jsonResponse({ message_id: `mid_${calls.length}`, recipient_id: "user_1" });
     }
     if (call.path.endsWith("/replies")) {

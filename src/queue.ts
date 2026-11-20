@@ -1,5 +1,6 @@
 import {
   GraphApiError,
+  getAccount,
   getToken,
   replyToComment,
   sendDirectMessage,
@@ -142,6 +143,7 @@ type JobOutcome = "sent" | "retried" | "failed";
 async function processJob(
   env: Env,
   token: string,
+  igUserId: string | null,
   job: OutboundJobRow,
   now: string,
 ): Promise<JobOutcome> {
@@ -158,7 +160,7 @@ async function processJob(
         throw new GraphApiError("Comment execution row is missing", { status: 400 });
       }
 
-      await sendPrivateReply(env, token, job.comment_id, text);
+      await sendPrivateReply(env, token, igUserId, job.comment_id, text);
 
       const deliveryMode: DeliveryMode =
         privatePayload.delivery_mode === "direct_link" ? "direct_link" : "two_step_opt_in";
@@ -213,7 +215,7 @@ async function processJob(
       if (!recipient) throw new GraphApiError("Follow-up DM has no recipient", { status: 400 });
       if (!text.trim()) throw new GraphApiError("Follow-up DM text is empty", { status: 400 });
 
-      await sendDirectMessage(env, token, recipient, text);
+      await sendDirectMessage(env, token, igUserId, recipient, text);
 
       await env.DB.batch([
         env.DB.prepare(
@@ -270,6 +272,9 @@ export async function drainQueue(
     return stats;
   }
 
+  const account = await getAccount(env);
+  const igUserId = account?.user_id ?? null;
+
   while (stats.claimed < maxJobs) {
     const limit = Math.min(CLAIM_BATCH, maxJobs - stats.claimed);
     const claimed = await env.DB.prepare(
@@ -291,7 +296,7 @@ export async function drainQueue(
 
     for (const job of jobs) {
       stats.claimed += 1;
-      const outcome = await processJob(env, token, job, nowString);
+      const outcome = await processJob(env, token, igUserId, job, nowString);
       if (outcome === "sent") stats.sent += 1;
       else if (outcome === "retried") stats.retried += 1;
       else stats.failed += 1;

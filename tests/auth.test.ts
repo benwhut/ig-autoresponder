@@ -184,7 +184,7 @@ describe("admin API safety", () => {
 describe("token management", () => {
   it("validates the token, stores it encrypted, and never writes plaintext", async () => {
     const cookie = await login(ctx);
-    const token = "IGQVJ-secret-token-value-abcdefghijklmnop";
+    const token = "IGAA-secret-token-value-abcdefghijklmnop";
 
     const response = await ctx.dispatch(
       jsonRequest("/admin/api/token", { token }, { cookie }),
@@ -215,7 +215,7 @@ describe("token management", () => {
 
     const cookie = await login(ctx);
     const response = await ctx.dispatch(
-      jsonRequest("/admin/api/token", { token: "bad-token-value-1234567890" }, { cookie }),
+      jsonRequest("/admin/api/token", { token: "IGAA-bad-token-value-1234567890" }, { cookie }),
     );
     expect(response.status).toBe(400);
     const body = (await response.json()) as { error: string };

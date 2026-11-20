@@ -1,7 +1,6 @@
-import type { AccountInfo, Env, MediaRow } from "./types";
+import type { AccountInfo, Env, MediaRow, TokenType } from "./types";
 import { isoPlusSeconds, nowIso } from "./types";
 
-const GRAPH_BASE = "https://graph.instagram.com";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -215,10 +214,10 @@ export async function getToken(env: Env): Promise<string | null> {
 export async function saveToken(
   env: Env,
   token: string,
-  expiresInSeconds = 60 * 24 * 60 * 60,
-): Promise<string> {
-  const expiresAt = isoPlusSeconds(expiresInSeconds);
-  await setConfig(env, "ig_token", token, expiresAt);
+  expiresInSeconds: number | null = 60 * 24 * 60 * 60,
+): Promise<string | null> {
+  const expiresAt = expiresInSeconds === null ? null : isoPlusSeconds(expiresInSeconds);
+  await setConfig(env, "ig_token", token.trim(), expiresAt);
   return expiresAt;
 }
 
@@ -244,6 +243,8 @@ export interface TokenStatus {
   expires_at: string | null;
   updated_at: string | null;
   days_left: number | null;
+  /** True for non-expiring System User tokens. */
+  never_expires: boolean;
 }
 
 export async function getTokenStatus(env: Env): Promise<TokenStatus> {
@@ -251,11 +252,36 @@ export async function getTokenStatus(env: Env): Promise<TokenStatus> {
     "SELECT expires_at, updated_at FROM system_config WHERE key = 'ig_token'",
   ).first<{ expires_at: string | null; updated_at: string }>();
 
-  if (!row) return { state: "missing", expires_at: null, updated_at: null, days_left: null };
+  if (!row) {
+    return {
+      state: "missing",
+      expires_at: null,
+      updated_at: null,
+      days_left: null,
+      never_expires: false,
+    };
+  }
 
-  const expiresMs = row.expires_at ? Date.parse(row.expires_at) : Number.NaN;
+  // A null expiry means a non-expiring System User token.
+  if (row.expires_at === null) {
+    return {
+      state: "ok",
+      expires_at: null,
+      updated_at: row.updated_at,
+      days_left: null,
+      never_expires: true,
+    };
+  }
+
+  const expiresMs = Date.parse(row.expires_at);
   if (Number.isNaN(expiresMs)) {
-    return { state: "ok", expires_at: row.expires_at, updated_at: row.updated_at, days_left: null };
+    return {
+      state: "ok",
+      expires_at: row.expires_at,
+      updated_at: row.updated_at,
+      days_left: null,
+      never_expires: false,
+    };
   }
 
   const days = (expiresMs - Date.now()) / 86_400_000;
@@ -268,6 +294,7 @@ export async function getTokenStatus(env: Env): Promise<TokenStatus> {
     expires_at: row.expires_at,
     updated_at: row.updated_at,
     days_left: Math.round(days * 10) / 10,
+    never_expires: false,
   };
 }
 
@@ -277,9 +304,53 @@ export async function getTokenStatus(env: Env): Promise<TokenStatus> {
 
 type JsonObject = Record<string, unknown>;
 
+function asObject(value: unknown): JsonObject {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as JsonObject)
+    : {};
+}
+
+function asString(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return String(value);
+  return "";
+}
+
 export function apiVersion(env: Env): string {
   const configured = env.GRAPH_API_VERSION?.trim();
   return configured && /^v\d+\.\d+$/.test(configured) ? configured : "v25.0";
+}
+
+/**
+ * IGAA… tokens belong to the Instagram Graph API (graph.instagram.com).
+ * Everything else — EAA… Business/System User/Page tokens — belongs to the
+ * Facebook Graph API (graph.facebook.com).
+ */
+export function detectTokenType(token: string): TokenType {
+  return token.trim().startsWith("IGAA") ? "instagram_graph" : "facebook_graph";
+}
+
+export function graphBaseUrl(env: Env, tokenType: TokenType): string {
+  const host =
+    tokenType === "instagram_graph"
+      ? "https://graph.instagram.com"
+      : "https://graph.facebook.com";
+  return `${host}/${apiVersion(env)}`;
+}
+
+/**
+ * On graph.facebook.com the actor is the resolved Instagram business account id,
+ * not `/me`. On graph.instagram.com the token's own `/me` is correct.
+ */
+export function actorPath(token: string, igUserId: string | null): string {
+  if (detectTokenType(token) === "instagram_graph") return "/me";
+  if (!igUserId) {
+    throw new GraphApiError(
+      "This token needs an Instagram business account id. Re-save the token in the admin dashboard.",
+      { status: 400 },
+    );
+  }
+  return `/${encodeURIComponent(igUserId)}`;
 }
 
 export class GraphApiError extends Error {
@@ -346,11 +417,13 @@ async function graphRequest(
   path: string,
   options: GraphRequestOptions = {},
 ): Promise<JsonObject> {
-  const url = new URL(`${GRAPH_BASE}/${apiVersion(env)}${path}`);
+  const trimmedToken = token.trim();
+  const base = graphBaseUrl(env, detectTokenType(trimmedToken));
+  const url = new URL(`${base}${path}`);
   for (const [key, value] of Object.entries(options.query ?? {})) {
     url.searchParams.set(key, value);
   }
-  url.searchParams.set("access_token", token);
+  url.searchParams.set("access_token", trimmedToken);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 10_000);
@@ -389,32 +462,130 @@ async function graphRequest(
   }
 }
 
-export async function validateToken(env: Env, token: string): Promise<AccountInfo> {
-  const data = await graphRequest(env, token, "/me", {
-    query: { fields: "user_id,username,account_type" },
-  });
+interface ResolvedInstagramAccount {
+  id: string;
+  username: string;
+}
 
-  const userId = String(data.user_id ?? data.id ?? "").trim();
-  if (!userId) {
-    throw new GraphApiError(
-      "The token is valid but did not return an Instagram account id. Make sure it was generated for an Instagram professional account.",
-      { status: 400 },
-    );
+/**
+ * Resolves the Instagram business account behind an EAA… token.
+ * 1. GET /me/assigned_instagram_accounts?fields=id,username
+ * 2. Fallback: GET /me/accounts?fields=instagram_business_account{id,username}
+ */
+async function resolveFacebookInstagramAccount(
+  env: Env,
+  token: string,
+): Promise<ResolvedInstagramAccount> {
+  let firstError: unknown = null;
+
+  try {
+    const assigned = await graphRequest(env, token, "/me/assigned_instagram_accounts", {
+      query: { fields: "id,username" },
+    });
+    const first = Array.isArray(assigned.data) ? asObject(assigned.data[0]) : null;
+    if (first && asString(first.id)) {
+      return { id: asString(first.id), username: asString(first.username) };
+    }
+  } catch (error) {
+    firstError = error;
   }
 
-  const username = String(data.username ?? "").trim();
-  const account: AccountInfo = {
-    user_id: userId,
-    username: username || "unknown",
+  try {
+    const accounts = await graphRequest(env, token, "/me/accounts", {
+      query: { fields: "instagram_business_account{id,username}" },
+    });
+    const pages = Array.isArray(accounts.data) ? accounts.data : [];
+    for (const page of pages) {
+      const business = asObject(asObject(page).instagram_business_account);
+      if (asString(business.id)) {
+        return { id: asString(business.id), username: asString(business.username) };
+      }
+    }
+  } catch (error) {
+    throw firstError ?? error;
+  }
+
+  throw (
+    firstError ??
+    new GraphApiError(
+      "The token is valid but no Instagram Business account was found. Make sure the token can access an Instagram professional account.",
+      { status: 400 },
+    )
+  );
+}
+
+/**
+ * Reads the token expiry from /debug_token. System User tokens return
+ * `expires_at: 0` (or omit it), which we store as a null expiry.
+ */
+async function detectTokenExpiry(env: Env, token: string): Promise<number | null> {
+  try {
+    const data = await graphRequest(env, token, "/debug_token", {
+      query: { input_token: token },
+    });
+    const info = asObject(data.data);
+    const expiresAt = Number(info.expires_at);
+    if (Number.isFinite(expiresAt) && expiresAt > 0) {
+      return Math.floor((expiresAt * 1000 - Date.now()) / 1000);
+    }
+    return null;
+  } catch (error) {
+    // A token without a readable expiry is treated as non-expiring. EAA tokens
+    // cannot be refreshed anyway, so this is the least misleading default.
+    console.error("Could not read token expiry from /debug_token", error);
+    return null;
+  }
+}
+
+export async function validateToken(env: Env, token: string): Promise<AccountInfo> {
+  const trimmed = token.trim();
+  const tokenType = detectTokenType(trimmed);
+
+  if (tokenType === "instagram_graph") {
+    const data = await graphRequest(env, trimmed, "/me", {
+      query: { fields: "user_id,username,account_type" },
+    });
+
+    const userId = String(data.user_id ?? data.id ?? "").trim();
+    if (!userId) {
+      throw new GraphApiError(
+        "The token is valid but did not return an Instagram account id. Make sure it was generated for an Instagram professional account.",
+        { status: 400 },
+      );
+    }
+
+    const username = String(data.username ?? "").trim();
+    const account: AccountInfo = {
+      user_id: userId,
+      username: username || "unknown",
+      token_type: "instagram_graph",
+      connected_at: nowIso(),
+    };
+    if (typeof data.account_type === "string") account.account_type = data.account_type;
+    return account;
+  }
+
+  const resolved = await resolveFacebookInstagramAccount(env, trimmed);
+  return {
+    user_id: resolved.id,
+    username: resolved.username || "unknown",
+    token_type: "facebook_graph",
     connected_at: nowIso(),
   };
-  if (typeof data.account_type === "string") account.account_type = data.account_type;
-  return account;
 }
 
 export async function connectToken(env: Env, token: string): Promise<AccountInfo> {
-  const account = await validateToken(env, token);
-  await saveToken(env, token);
+  const trimmed = token.trim();
+  const account = await validateToken(env, trimmed);
+
+  // IGAA tokens expire in ~60 days. EAA tokens may be System User tokens that
+  // never expire, so ask /debug_token for the real expiry.
+  const expiresInSeconds =
+    account.token_type === "facebook_graph"
+      ? await detectTokenExpiry(env, trimmed)
+      : 60 * 24 * 60 * 60;
+
+  await saveToken(env, trimmed, expiresInSeconds);
   await saveAccount(env, account);
   return account;
 }
@@ -422,13 +593,16 @@ export async function connectToken(env: Env, token: string): Promise<AccountInfo
 export interface RefreshResult {
   refreshed: boolean;
   reason?: string;
-  expires_at?: string;
+  expires_at?: string | null;
 }
 
 /**
  * Refreshes the long-lived Instagram user token.
  * Meta requires the current token to be at least 24 hours old.
  * Auto-refresh only runs when the token expires in less than 30 days.
+ *
+ * Only IGAA… (graph.instagram.com) tokens support refresh. EAA… System User
+ * tokens are managed in Meta Business Suite and never expire.
  */
 export async function refreshToken(
   env: Env,
@@ -437,8 +611,21 @@ export async function refreshToken(
   const row = await getConfig(env, "ig_token");
   if (!row) return { refreshed: false, reason: "No Instagram token has been configured yet" };
 
+  const account = await getAccount(env);
+  const tokenType = account?.token_type ?? detectTokenType(row.value);
+  if (tokenType !== "instagram_graph") {
+    return {
+      refreshed: false,
+      reason: "Business/System User tokens do not support refresh; they are managed in Meta Business Suite",
+    };
+  }
+
+  if (row.expires_at === null) {
+    return { refreshed: false, reason: "Token never expires" };
+  }
+
   const now = Date.now();
-  const expiresMs = row.expires_at ? Date.parse(row.expires_at) : Number.NaN;
+  const expiresMs = Date.parse(row.expires_at);
   const ageMs = now - Date.parse(row.updated_at);
 
   if (!options.force) {
@@ -452,7 +639,7 @@ export async function refreshToken(
 
   const url = new URL("https://graph.instagram.com/refresh_access_token");
   url.searchParams.set("grant_type", "ig_refresh_token");
-  url.searchParams.set("access_token", row.value);
+  url.searchParams.set("access_token", row.value.trim());
 
   let response: Response;
   try {
@@ -498,10 +685,11 @@ export async function refreshToken(
 export async function sendPrivateReply(
   env: Env,
   token: string,
+  igUserId: string | null,
   commentId: string,
   text: string,
 ): Promise<void> {
-  await graphRequest(env, token, "/me/messages", {
+  await graphRequest(env, token, `${actorPath(token, igUserId)}/messages`, {
     method: "POST",
     body: { recipient: { comment_id: commentId }, message: { text } },
   });
@@ -510,10 +698,11 @@ export async function sendPrivateReply(
 export async function sendDirectMessage(
   env: Env,
   token: string,
+  igUserId: string | null,
   recipientIgsid: string,
   text: string,
 ): Promise<void> {
-  await graphRequest(env, token, "/me/messages", {
+  await graphRequest(env, token, `${actorPath(token, igUserId)}/messages`, {
     method: "POST",
     body: { recipient: { id: recipientIgsid }, message: { text } },
   });
@@ -544,8 +733,13 @@ function normalizeMediaType(raw: unknown, product: unknown): MediaRow["media_typ
   return "IMAGE";
 }
 
-export async function fetchRecentMedia(env: Env, token: string, limit = 25): Promise<MediaRow[]> {
-  const data = await graphRequest(env, token, "/me/media", {
+export async function fetchRecentMedia(
+  env: Env,
+  token: string,
+  igUserId: string | null,
+  limit = 25,
+): Promise<MediaRow[]> {
+  const data = await graphRequest(env, token, `${actorPath(token, igUserId)}/media`, {
     query: {
       fields: "id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp",
       limit: String(limit),

@@ -55,9 +55,15 @@ export interface SystemConfigRow {
   updated_at: string;
 }
 
+/** Which Graph host issued the token. */
+export type TokenType = "instagram_graph" | "facebook_graph";
+
 export interface AccountInfo {
+  /** Instagram professional account id (the `ig_user_id`). */
   user_id: string;
   username: string;
+  /** `instagram_graph` for IGAA… tokens, `facebook_graph` for EAA… tokens. */
+  token_type?: TokenType;
   account_type?: string;
   connected_at?: string;
 }

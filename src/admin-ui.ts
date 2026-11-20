@@ -298,7 +298,7 @@ export function dashboardPage(): string {
         <span id="conn-id"></span>
       </div>
       <span class="pill" id="token-label">—</span>
-      <button class="btn tiny" id="btn-refresh-token" title="Ask Meta for a fresh 60-day token">Refresh token</button>
+      <button class="btn tiny" id="btn-refresh-token" title="Ask Meta for a fresh 60-day token (IGAA… tokens only)">Refresh token</button>
       <button class="btn tiny" id="btn-rotate-token">Set token</button>
       <button class="btn tiny ghost" id="btn-logout">Sign out</button>
     </div>
@@ -540,7 +540,7 @@ export function dashboardPage(): string {
     var text = 'No token';
     var kind = 'bad';
     if (token.state === 'ok') {
-      text = 'Expires in ' + Math.max(0, Math.floor(token.days_left || 0)) + 'd';
+      text = token.never_expires ? 'Never expires' : 'Expires in ' + Math.max(0, Math.floor(token.days_left || 0)) + 'd';
       kind = 'ok';
     } else if (token.state === 'expiring') {
       text = 'Expires in ' + Math.max(0, Math.floor(token.days_left || 0)) + 'd';
@@ -551,7 +551,9 @@ export function dashboardPage(): string {
     }
     label.textContent = text;
     label.className = 'pill ' + kind;
-    if (token.expires_at) label.title = 'Expires ' + fmtDate(token.expires_at);
+    label.title = token.never_expires
+      ? 'This token does not expire'
+      : (token.expires_at ? 'Expires ' + fmtDate(token.expires_at) : '');
   }
 
   /* ---------------------------------------------------------------- */
@@ -1243,14 +1245,14 @@ export function dashboardPage(): string {
     openModal(''
       + '<div class="modal-head">'
       + '<div><h2>Set Instagram token</h2>'
-      + '<p class="muted small">Paste a long-lived Instagram User Access Token.</p></div>'
+      + '<p class="muted small">Paste an Instagram token (IGAA…) or a Meta Business/System User token (EAA…).</p></div>'
       + '<button type="button" class="icon-btn" data-close="1" aria-label="Close">✕</button>'
       + '</div>'
       + '<div class="modal-body">'
       + '<div class="field"><label for="token-input">Access token</label>'
-      + '<textarea id="token-input" rows="4" placeholder="IGQVJ…"></textarea>'
-      + '<p class="hint">Meta App Dashboard → Instagram → API setup with Instagram business login → Generate token. '
-      + 'It is validated with GET /me, then encrypted with AES-256-GCM before it touches the database.</p></div>'
+      + '<textarea id="token-input" rows="4" placeholder="IGAA… or EAA…"></textarea>'
+      + '<p class="hint">IGAA… tokens are validated against graph.instagram.com; EAA… tokens against graph.facebook.com. '
+      + 'The token is encrypted with AES-256-GCM before it touches the database.</p></div>'
       + '<div class="modal-foot">'
       + '<button type="button" class="btn ghost" data-close="1">Cancel</button>'
       + '<button type="button" class="btn primary" id="btn-save-token">Validate &amp; save</button>'

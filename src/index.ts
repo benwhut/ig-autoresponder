@@ -721,7 +721,8 @@ app.post("/admin/api/media/sync", async (c) => {
     const token = await getToken(c.env);
     if (!token) return c.json({ error: "No Instagram token configured" }, 400);
 
-    const items = await fetchRecentMedia(c.env, token, 25);
+    const account = await getAccount(c.env);
+    const items = await fetchRecentMedia(c.env, token, account?.user_id ?? null, 25);
     await cacheMedia(c.env, items);
 
     const rows = await c.env.DB.prepare(

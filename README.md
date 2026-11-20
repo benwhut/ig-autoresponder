@@ -4,7 +4,7 @@ A single-tenant, zero-cost Instagram comment autoresponder that runs entirely on
 
 When someone comments a keyword on your post or reel, the Worker sends a private reply. In the default **two-step opt-in** mode it asks the user to reply first, then delivers the clean `https://` link in a second DM — so the link is clickable even when the first message lands in Message Requests. A **direct link** mode sends everything in the first private reply.
 
-No Facebook Page, no OAuth SaaS onboarding, no Redis, no external queue, no third-party hosting.
+No Facebook Page is required for the Instagram Login (`IGAA…`) flow; Meta Business/System User (`EAA…`) tokens are also supported. No OAuth SaaS onboarding, no Redis, no external queue, no third-party hosting.
 
 ---
 
@@ -16,8 +16,9 @@ No Facebook Page, no OAuth SaaS onboarding, no Redis, no external queue, no thir
 - **Two delivery modes** — `two_step_opt_in` (default) and `direct_link`.
 - **Optional public comment replies** — a random variant from a list, posted 3 seconds after the private reply.
 - **D1 job queue** — idempotent enqueue, atomic claim, exponential backoff, 1-minute cron safety net, plus an inline drain on webhook receipt so DMs go out in ~1–2 seconds.
-- **Encrypted token storage** — the long-lived Instagram token is encrypted with AES-256-GCM (Web Crypto) before it touches D1.
-- **Zero-touch token refresh** — a daily cron refreshes the 60-day token when it has less than 30 days left.
+- **Encrypted token storage** — the Instagram token (IGAA… or EAA…) is encrypted with AES-256-GCM (Web Crypto) before it touches D1.
+- **Token host auto-detection** — `IGAA…` tokens use `graph.instagram.com`; `EAA…` Business/System User tokens use `graph.facebook.com` and are resolved to an Instagram business account.
+- **Zero-touch token refresh** — a daily cron refreshes 60-day IGAA tokens when they have less than 30 days left. Non-expiring EAA System User tokens are left alone and shown as “Never expires”.
 - **Admin dashboard** — rules CRUD, post sync + visual picker, token health/rotation, searchable delivery logs, failed-job retry.
 
 ---
@@ -51,6 +52,7 @@ No Facebook Page, no OAuth SaaS onboarding, no Redis, no external queue, no thir
 │   ├── webhook.test.ts
 │   ├── matcher.test.ts
 │   ├── flow.test.ts
+│   ├── meta.test.ts
 │   ├── auth.test.ts
 │   ├── ui.test.ts
 │   ├── helpers.ts
@@ -73,7 +75,8 @@ You need an **Instagram professional account** (Business or Creator). No Faceboo
 4. Generate the token:
    - Instagram → **API setup with Instagram business login** → **Generate access tokens**
    - Log in with the Instagram account and authorize.
-   - Copy the **long-lived Instagram User Access Token** (valid ~60 days).
+   - Copy the **long-lived Instagram User Access Token** (starts with `IGAA…`, valid ~60 days).
+   - Alternatively, paste a **Meta Business / System User Access Token** (starts with `EAA…`). The Worker detects the prefix: `IGAA…` uses `graph.instagram.com`, anything else uses `graph.facebook.com`. EAA tokens are resolved to an Instagram business account via `/me/assigned_instagram_accounts` (falling back to `/me/accounts`), and System User tokens that never expire are stored without an expiry date.
 5. Copy the **Instagram App Secret**:
    - Instagram product → **API setup with Instagram business login** → **App secret**
    - This is the secret Meta uses to sign Instagram webhook payloads. It is usually *not* the Facebook App Secret under App settings → Basic.
@@ -152,8 +155,8 @@ npx wrangler deploy
 ### First-run checklist
 
 1. Open `https://<your-worker>.workers.dev/admin` and sign in with `ADMIN_PASSWORD`.
-2. Click **Set token**, paste the long-lived Instagram token, and save. The backend validates it with `GET /me`, stores the account id/username, and encrypts the token.
-3. Go to **Posts** → **Sync recent posts** (pulls the latest 25 posts/reels via `GET /me/media`).
+2. Click **Set token**, paste the token, and save. `IGAA…` tokens are validated with `GET /me` on `graph.instagram.com`; `EAA…` tokens are resolved to an Instagram business account on `graph.facebook.com`. The account id/username and token type are stored and the token is encrypted.
+3. Go to **Posts** → **Sync recent posts** (pulls the latest 25 posts/reels via `GET /{ig_user_id}/media` on Facebook Graph, or `GET /me/media` on Instagram Graph).
 4. Create a rule:
    - Target: **All posts** or **Selected posts**
    - Trigger: **Specific keywords** (e.g. `link`, `guide`, `pdf`) or **Any comment**
@@ -249,13 +252,28 @@ Meta limits private replies to **one per comment** and **7 days after the commen
 
 ## 6. Token lifecycle
 
-- The token is validated with `GET /me?fields=user_id,username,account_type`.
-- Stored in `system_config` as AES-256-GCM ciphertext: `v1.<iv>.<ciphertext>`.
-- `expires_at` is set to `now + 60 days`.
-- The daily cron (`0 6 * * *`) calls `GET https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token` when:
+### Host selection
+
+The token prefix picks the Graph host:
+
+| Prefix | Host | Account resolution |
+| --- | --- | --- |
+| `IGAA…` | `https://graph.instagram.com` | `GET /me?fields=user_id,username` |
+| `EAA…` (or anything else) | `https://graph.facebook.com` | `GET /me/assigned_instagram_accounts?fields=id,username`, then `GET /me/accounts?fields=instagram_business_account{id,username}` |
+
+For Facebook Graph tokens the Worker sends media sync, private replies and follow-up DMs to `/{ig_user_id}/…` instead of `/me/…`. Public comment replies always use `POST /{comment_id}/replies`.
+
+### Storage and refresh
+
+- The token is stored in `system_config` as AES-256-GCM ciphertext: `v1.<iv>.<ciphertext>`.
+- `IGAA…` tokens get `expires_at = now + 60 days`. `EAA…` tokens are inspected with `GET /debug_token`; when `data.expires_at` is `0` or missing (System User tokens), `expires_at` is stored as `null` and the dashboard shows **Never expires**.
+- The daily cron (`0 6 * * *`) calls `GET https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token` only when:
+  - the token is an `IGAA…` (Instagram Graph) token, **and**
+  - `expires_at` is set, **and**
   - the token expires in less than 30 days, **and**
   - the token was stored at least 24 hours ago (Meta rejects younger tokens).
-- The **Refresh token** button forces a refresh immediately. Meta may reject it if the token is less than 24 hours old; the error is shown in the dashboard.
+- EAA… Business/System User tokens are never refreshed by the Worker; they are managed in Meta Business Suite. The **Refresh token** button explains this instead of calling Meta.
+- The **Refresh token** button forces an IGAA refresh immediately. Meta may reject it if the token is less than 24 hours old; the error is shown in the dashboard.
 
 The queue cron runs every minute (`* * * * *`) as a safety net for retries and the delayed public reply. Both cron expressions are in `wrangler.toml`.
 
@@ -346,13 +364,14 @@ npm run db:migrate:local # apply schema to local D1
 npm run db:migrate:remote
 ```
 
-The test suite uses Node's built-in SQLite through a small D1 adapter, so it exercises real SQL (`ON CONFLICT`, `RETURNING`, batches) without downloading a Workers runtime. 61 tests cover:
+The test suite uses Node's built-in SQLite through a small D1 adapter, so it exercises real SQL (`ON CONFLICT`, `RETURNING`, batches) without downloading a Workers runtime. 73 tests cover:
 
 - HMAC signature verification, handshake, echo filtering, duplicate comment idempotency
 - whole-word/phrase keyword matching, post-specific vs. global precedence, priority ordering
 - two-step opt-in transitions, opt-in keywords, 24-hour window, duplicate DM suppression
 - direct-link mode, public reply variants, retry/backoff, permanent-error handling
 - login throttling, session tampering, CSRF guard, token encryption at rest, media sync
+- EAA token resolution (`/me/assigned_instagram_accounts`, `/me/accounts` fallback), `/{ig_user_id}/messages` routing, non-expiring System User tokens
 - dashboard script syntax + no external dependencies
 
 ---
@@ -367,12 +386,14 @@ The test suite uses Node's built-in SQLite through a small D1 adapter, so it exe
 | No DMs sent | Check Activity → error. Common: token missing/expired, private reply already used, comment older than 7 days, 24-hour window closed |
 | Links are not clickable | Expected for the first DM to non-followers. Use two-step opt-in |
 | Token refresh returns 400 | Token is less than 24 hours old, already refreshed, or invalid. Paste a new token |
+| “Business/System User tokens do not support refresh” | Expected for EAA tokens. Manage them in Meta Business Suite; the Worker does not refresh them |
+| “No Instagram Business account was found” | The EAA token cannot see an Instagram professional account. Check the token's assets/permissions in Meta Business Suite |
 | `no such table` | Run `wrangler d1 migrations apply DB --remote` |
 | `TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes` | Regenerate with `openssl rand -base64 32` |
 | Login redirects back to the form | Cookies blocked, `SESSION_SECRET` changed, or accessing over plain HTTP on a non-localhost host |
 | Admin API returns 415 | Send `Content-Type: application/json` |
 | Public reply arrives late | It is scheduled at +3s and sent by the 1-minute cron, so allow up to ~60s |
-| Token shows “expired” | Paste a fresh long-lived token in **Set token** |
+| Token shows “expired” | Paste a fresh token in **Set token** |
 
 ### Changing the Graph API version
 
