@@ -1,0 +1,31 @@
+name = "ig-comment-autoresponder"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+workers_dev = true
+
+# Free-tier friendly: Workers 100k req/day, D1 5M reads + 100k writes/day.
+# No queues, no Redis, no external services.
+
+[observability]
+enabled = true
+
+[vars]
+GRAPH_API_VERSION = "v25.0"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ig_autoresponder"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# 1-minute tick = queue safety net (retries, public replies scheduled +3s).
+# Daily 06:00 UTC = long-lived token refresh check.
+[triggers]
+crons = ["* * * * *", "0 6 * * *"]
+
+# Secrets are NOT set here. Use:
+#   wrangler secret put IG_APP_SECRET
+#   wrangler secret put WEBHOOK_VERIFY_TOKEN
+#   wrangler secret put ADMIN_PASSWORD
+#   wrangler secret put SESSION_SECRET
+#   wrangler secret put TOKEN_ENCRYPTION_KEY
