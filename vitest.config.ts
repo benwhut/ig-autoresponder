@@ -7,5 +7,6 @@ export default defineConfig({
     testTimeout: 15000,
     hookTimeout: 15000,
     restoreMocks: true,
+    silent: "passed-only",
   },
 });

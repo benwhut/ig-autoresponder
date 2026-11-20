@@ -23,7 +23,7 @@ export interface TestContext {
   waits: Promise<unknown>[];
   dispatch(request: Request): Promise<Response>;
   settle(): Promise<void>;
-  close(): void;
+  close(): Promise<void>;
 }
 
 export async function createTestContext(
@@ -64,7 +64,10 @@ export async function createTestContext(
       const pending = ctx.waits.splice(0);
       await Promise.allSettled(pending);
     },
-    close(): void {
+    async close(): Promise<void> {
+      // Drain any waitUntil work (e.g. an inline queue drain) before closing,
+      // otherwise it fails later with "database is not open".
+      await ctx.settle();
       sqlite.close();
     },
   };

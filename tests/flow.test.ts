@@ -23,8 +23,8 @@ beforeEach(async () => {
   meta = installMetaMock();
 });
 
-afterEach(() => {
-  ctx.close();
+afterEach(async () => {
+  await ctx.close();
   vi.unstubAllGlobals();
 });
 
