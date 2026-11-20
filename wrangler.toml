@@ -14,8 +14,8 @@ GRAPH_API_VERSION = "v25.0"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "ig_autoresponder"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_name = "ig_autoresponder-db"
+database_id = "5deca4ec-7625-4040-9dd0-7bc34c5a13d7"
 migrations_dir = "migrations"
 
 # 1-minute tick = queue safety net (retries, public replies scheduled +3s).
