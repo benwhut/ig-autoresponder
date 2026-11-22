@@ -405,31 +405,64 @@ async function handleMessage(
   ownerId: string | null,
 ): Promise<void> {
   const message = asObject(event.message);
-  if (message.is_echo === true) return;
-
   const sender = asObject(event.sender);
   const senderId = asString(sender.id);
-
-  // Ignore messages sent by the account itself.
-  if (!senderId || (ownerId !== null && senderId === ownerId)) return;
-
+  const recipientId = asString(asObject(event.recipient).id);
   const text = typeof message.text === "string" ? message.text : "";
-  if (!text.trim()) return;
+
+  // Only echoes and non-text events are ignored outright.
+  if (message.is_echo === true) {
+    console.log("inbound dm", {
+      senderId,
+      recipientId,
+      text,
+      matchedSessionId: null,
+      reason: "echo",
+    });
+    return;
+  }
+
+  if (!text.trim()) {
+    console.log("inbound dm", {
+      senderId,
+      recipientId,
+      text,
+      matchedSessionId: null,
+      reason: "no_text",
+    });
+    return;
+  }
+
+  // Ignore messages sent by the account itself (loop prevention).
+  if (!senderId || (ownerId !== null && senderId === ownerId)) {
+    console.log("inbound dm", {
+      senderId,
+      recipientId,
+      text,
+      matchedSessionId: null,
+      reason: senderId ? "self" : "no_sender",
+    });
+    return;
+  }
 
   const threshold = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  // The Step 1 private reply response carries Meta's `recipient_id`, which is
+  // the same id that arrives here as `messaging.sender.id`. Match on either it
+  // or the commenter id from `from.id`, so the handshake works for both.
   const row = await env.DB.prepare(
     `SELECT ce.*, r.opt_in_keywords_json AS rule_opt_in_keywords_json,
             r.followup_dm_text AS rule_followup_dm_text
      FROM comment_executions ce
      LEFT JOIN rules r ON r.id = ce.rule_id
-     WHERE ce.commenter_igsid = ?
+     WHERE (ce.recipient_igsid = ? OR ce.commenter_igsid = ?)
        AND ce.state = 'awaiting_opt_in'
        AND ce.private_reply_sent_at IS NOT NULL
        AND ce.private_reply_sent_at >= ?
      ORDER BY ce.private_reply_sent_at DESC
      LIMIT 1`,
   )
-    .bind(senderId, threshold)
+    .bind(senderId, senderId, threshold)
     .first<
       CommentExecutionRow & {
         rule_opt_in_keywords_json: string | null;
@@ -437,10 +470,36 @@ async function handleMessage(
       }
     >();
 
-  if (!row) return;
+  if (!row) {
+    console.log("inbound dm", {
+      senderId,
+      recipientId,
+      text,
+      matchedSessionId: null,
+      reason: "no_pending_opt_in",
+    });
+    return;
+  }
 
   const optInKeywords = parseStringArray(row.rule_opt_in_keywords_json);
-  if (optInKeywords.length > 0 && !findMatchingKeyword(text, optInKeywords)) return;
+  if (optInKeywords.length > 0 && !findMatchingKeyword(text, optInKeywords)) {
+    console.log("inbound dm", {
+      senderId,
+      recipientId,
+      text,
+      matchedSessionId: row.comment_id,
+      reason: "keyword_mismatch",
+    });
+    return;
+  }
+
+  console.log("inbound dm", {
+    senderId,
+    recipientId,
+    text,
+    matchedSessionId: row.comment_id,
+    reason: "matched",
+  });
 
   const now = new Date().toISOString();
   const followupText = (row.rule_followup_dm_text ?? "").trim();
@@ -459,14 +518,16 @@ async function handleMessage(
   // Atomic transition: only one inbound DM can complete the opt-in.
   const updated = await env.DB.prepare(
     `UPDATE comment_executions
-     SET state = 'completed', opt_in_completed_at = ?, updated_at = ?
+     SET state = 'completed', opt_in_completed_at = ?,
+         recipient_igsid = COALESCE(recipient_igsid, ?), updated_at = ?
      WHERE comment_id = ? AND state = 'awaiting_opt_in'`,
   )
-    .bind(now, now, row.comment_id)
+    .bind(now, senderId, now, row.comment_id)
     .run();
 
   if ((updated.meta.changes ?? 0) !== 1) return;
 
+  // Step 2: POST /{ig_user_id}/messages with recipient.id = senderId.
   await enqueueJob(env, {
     jobType: "followup_dm",
     commentId: row.comment_id,

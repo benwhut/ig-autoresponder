@@ -119,6 +119,8 @@ export interface CommentExecutionRow {
   comment_id: string;
   media_id: string;
   commenter_igsid: string;
+  /** Instagram-scoped id returned by Meta as `recipient_id` for the private reply. */
+  recipient_igsid: string | null;
   commenter_username: string | null;
   comment_text: string;
   rule_id: string | null;

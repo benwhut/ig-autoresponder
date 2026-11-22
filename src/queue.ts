@@ -160,7 +160,18 @@ async function processJob(
         throw new GraphApiError("Comment execution row is missing", { status: 400 });
       }
 
-      await sendPrivateReply(env, token, igUserId, job.comment_id, text);
+      const { recipientId } = await sendPrivateReply(
+        env,
+        token,
+        igUserId,
+        job.comment_id,
+        text,
+      );
+
+      // Meta echoes the Instagram-scoped user id it delivered to. Inbound
+      // messaging events identify the same user as `messaging.sender.id`, so
+      // persist it for the opt-in handshake (falling back to the commenter id).
+      const optInRecipient = recipientId ?? execution.commenter_igsid;
 
       const deliveryMode: DeliveryMode =
         privatePayload.delivery_mode === "direct_link" ? "direct_link" : "two_step_opt_in";
@@ -172,9 +183,11 @@ async function processJob(
           ).bind(now, job.id),
           env.DB.prepare(
             `UPDATE comment_executions
-             SET state = 'awaiting_opt_in', private_reply_sent_at = ?, last_error = NULL, updated_at = ?
+             SET state = 'awaiting_opt_in', private_reply_sent_at = ?,
+                 recipient_igsid = COALESCE(?, recipient_igsid),
+                 last_error = NULL, updated_at = ?
              WHERE comment_id = ?`,
-          ).bind(now, now, job.comment_id),
+          ).bind(now, optInRecipient, now, job.comment_id),
         ]);
       } else {
         await env.DB.batch([
@@ -184,9 +197,10 @@ async function processJob(
           env.DB.prepare(
             `UPDATE comment_executions
              SET state = 'completed', private_reply_sent_at = ?, opt_in_completed_at = ?,
+                 recipient_igsid = COALESCE(?, recipient_igsid),
                  last_error = NULL, updated_at = ?
              WHERE comment_id = ?`,
-          ).bind(now, now, now, job.comment_id),
+          ).bind(now, now, optInRecipient, now, job.comment_id),
         ]);
       }
       return "sent";

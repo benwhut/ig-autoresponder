@@ -682,17 +682,28 @@ export async function refreshToken(
 /* Messaging endpoints                                                 */
 /* ------------------------------------------------------------------ */
 
+export interface MessageSendResult {
+  /** `recipient_id` echoed by Meta — matches `messaging.sender.id` on replies. */
+  recipientId: string | null;
+  messageId: string | null;
+}
+
 export async function sendPrivateReply(
   env: Env,
   token: string,
   igUserId: string | null,
   commentId: string,
   text: string,
-): Promise<void> {
-  await graphRequest(env, token, `${actorPath(token, igUserId)}/messages`, {
+): Promise<MessageSendResult> {
+  const data = await graphRequest(env, token, `${actorPath(token, igUserId)}/messages`, {
     method: "POST",
     body: { recipient: { comment_id: commentId }, message: { text } },
   });
+
+  return {
+    recipientId: asString(data.recipient_id) || null,
+    messageId: asString(data.message_id) || null,
+  };
 }
 
 export async function sendDirectMessage(
@@ -701,11 +712,16 @@ export async function sendDirectMessage(
   igUserId: string | null,
   recipientIgsid: string,
   text: string,
-): Promise<void> {
-  await graphRequest(env, token, `${actorPath(token, igUserId)}/messages`, {
+): Promise<MessageSendResult> {
+  const data = await graphRequest(env, token, `${actorPath(token, igUserId)}/messages`, {
     method: "POST",
     body: { recipient: { id: recipientIgsid }, message: { text } },
   });
+
+  return {
+    recipientId: asString(data.recipient_id) || recipientIgsid,
+    messageId: asString(data.message_id) || null,
+  };
 }
 
 export async function replyToComment(

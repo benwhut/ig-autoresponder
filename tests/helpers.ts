@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { vi } from "vitest";
 import type { D1Database } from "@cloudflare/workers-types";
@@ -32,7 +32,13 @@ export async function createTestContext(
   options: { withAccount?: boolean; withToken?: boolean } = {},
 ): Promise<TestContext> {
   const sqlite = new DatabaseSync(":memory:");
-  sqlite.exec(readFileSync(new URL("../migrations/0001_init.sql", import.meta.url), "utf8"));
+  const migrationsDir = new URL("../migrations/", import.meta.url);
+  const migrationFiles = readdirSync(migrationsDir)
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+  for (const name of migrationFiles) {
+    sqlite.exec(readFileSync(new URL(name, migrationsDir), "utf8"));
+  }
   const db = new D1Sqlite(sqlite) as unknown as D1Database;
 
   const env: Env = {

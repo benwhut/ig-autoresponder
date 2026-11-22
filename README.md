@@ -39,7 +39,8 @@ No Facebook Page is required for the Instagram Login (`IGAA…`) flow; Meta Busi
 ├── wrangler.toml
 ├── .dev.vars.example
 ├── migrations/
-│   └── 0001_init.sql
+│   ├── 0001_init.sql
+│   └── 0002_recipient_igsid.sql
 ├── src/
 │   ├── index.ts          # HTTP router, webhook, admin API, scheduled handler
 │   ├── meta.ts           # HMAC, Graph API client, AES-GCM token storage, refresh
@@ -122,7 +123,7 @@ migrations_dir = "migrations"
 npx wrangler d1 migrations apply DB --remote
 ```
 
-(Equivalent to applying `migrations/0001_init.sql`; the SQL is idempotent and can be re-run.)
+(Applies every file in `migrations/` in order, including `0002_recipient_igsid.sql`, which adds the `recipient_igsid` column used by the opt-in handshake.)
 
 ### Set secrets
 
@@ -234,11 +235,12 @@ Keyword normalization lowercases, applies Unicode NFKC, and replaces punctuation
 ### Two-step opt-in (default)
 
 1. Comment matches → private reply with `initial_dm_text` (no link, just “reply YES”).
-2. Execution state becomes `awaiting_opt_in`; `private_reply_sent_at` is recorded.
-3. When the user DMs you within 24 hours:
+2. Meta’s response (`{ recipient_id, message_id }`) is captured and stored as `recipient_igsid` next to the comment’s `commenter_igsid`. Execution state becomes `awaiting_opt_in`; `private_reply_sent_at` is recorded.
+3. When the user DMs you within 24 hours, the inbound `messaging.sender.id` is matched against **either** `recipient_igsid` or `commenter_igsid` (they are usually the same, but not guaranteed):
    - If `opt_in_keywords` is empty, any text reply counts.
    - Otherwise the reply must contain one of the keywords as a whole word.
-4. The execution becomes `completed` and a `followup_dm` job sends `followup_dm_text` with the clean link.
+   - Echoes (`message.is_echo === true`) and textless events are ignored. Each decision logs `inbound dm { senderId, recipientId, text, matchedSessionId, reason }` for `wrangler tail`.
+4. The execution becomes `completed` and a `followup_dm` job sends `followup_dm_text` with the clean link via `POST /{ig_user_id}/messages` and `{ recipient: { id: senderId } }`.
 
 This is the recommended mode: the first DM can land in Message Requests (where links are not clickable), but the user’s reply opens a normal 24-hour messaging window, so the second DM is fully interactive.
 
@@ -364,11 +366,12 @@ npm run db:migrate:local # apply schema to local D1
 npm run db:migrate:remote
 ```
 
-The test suite uses Node's built-in SQLite through a small D1 adapter, so it exercises real SQL (`ON CONFLICT`, `RETURNING`, batches) without downloading a Workers runtime. 73 tests cover:
+The test suite uses Node's built-in SQLite through a small D1 adapter, so it exercises real SQL (`ON CONFLICT`, `RETURNING`, batches) without downloading a Workers runtime. 79 tests cover:
 
 - HMAC signature verification, handshake, echo filtering, duplicate comment idempotency
 - whole-word/phrase keyword matching, post-specific vs. global precedence, priority ordering
 - two-step opt-in transitions, opt-in keywords, 24-hour window, duplicate DM suppression
+- private-reply `recipient_id` capture, inbound DM matching on either id, structured skip/match logs
 - direct-link mode, public reply variants, retry/backoff, permanent-error handling
 - login throttling, session tampering, CSRF guard, token encryption at rest, media sync
 - EAA token resolution (`/me/assigned_instagram_accounts`, `/me/accounts` fallback), `/{ig_user_id}/messages` routing, non-expiring System User tokens
