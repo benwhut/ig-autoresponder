@@ -1,4 +1,4 @@
-import type { AccountInfo, Env, MediaRow, TokenType } from "./types";
+import type { AccountInfo, Env, MediaRow, PageAccountInfo, TokenType } from "./types";
 import { isoPlusSeconds, nowIso } from "./types";
 
 const encoder = new TextEncoder();
@@ -236,6 +236,62 @@ export async function getAccount(env: Env): Promise<AccountInfo | null> {
 
 export async function saveAccount(env: Env, account: AccountInfo): Promise<void> {
   await setConfig(env, "ig_account", JSON.stringify(account), null);
+}
+
+/* ------------------------------------------------------------------ */
+/* Facebook Page config                                                */
+/* ------------------------------------------------------------------ */
+
+export async function getPage(env: Env): Promise<PageAccountInfo | null> {
+  try {
+    const row = await getConfig(env, "fb_page");
+    if (!row) return null;
+    const parsed = JSON.parse(row.value) as PageAccountInfo;
+    return parsed?.page_id ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function savePage(env: Env, page: PageAccountInfo): Promise<void> {
+  await setConfig(env, "fb_page", JSON.stringify(page), null);
+}
+
+export async function deletePage(env: Env): Promise<void> {
+  await deleteConfig(env, "fb_page");
+}
+
+/**
+ * The token used for Messenger calls. A dedicated Page token wins; otherwise
+ * the main Instagram/Business token is used (a System User token with the Page
+ * asset works for both).
+ */
+export async function getPageToken(env: Env): Promise<string | null> {
+  try {
+    const row = await getConfig(env, "fb_page_token");
+    if (row?.value) return row.value;
+  } catch {
+    /* fall through to the main token */
+  }
+  return getToken(env);
+}
+
+export async function savePageToken(env: Env, token: string): Promise<void> {
+  await setConfig(env, "fb_page_token", token, null);
+}
+
+/** True when a dedicated Page token is stored (not the main-token fallback). */
+export async function hasPageToken(env: Env): Promise<boolean> {
+  try {
+    const row = await getConfig(env, "fb_page_token");
+    return Boolean(row?.value);
+  } catch {
+    return false;
+  }
+}
+
+export async function deletePageToken(env: Env): Promise<void> {
+  await deleteConfig(env, "fb_page_token");
 }
 
 export interface TokenStatus {
@@ -590,6 +646,85 @@ export async function connectToken(env: Env, token: string): Promise<AccountInfo
   return account;
 }
 
+/**
+ * Resolves and stores the Facebook Page used for Messenger replies.
+ *
+ * Order:
+ *  1. An explicit `pageId` argument.
+ *  2. `/me/accounts` — pick the Page linked to the Instagram account, else the first.
+ *  3. `/me` — a Page access token resolves to the Page itself.
+ */
+export async function connectPage(
+  env: Env,
+  options: { token?: string; pageId?: string } = {},
+): Promise<PageAccountInfo> {
+  const token = (options.token ?? (await getPageToken(env)) ?? "").trim();
+  if (!token) {
+    throw new GraphApiError(
+      "No Facebook Page token is configured. Save a Page access token first.",
+      { status: 400 },
+    );
+  }
+
+  if (options.pageId) {
+    const data = await graphRequest(env, token, `/${encodeURIComponent(options.pageId)}`, {
+      query: { fields: "id,name" },
+    });
+    const page: PageAccountInfo = {
+      page_id: asString(data.id) || options.pageId,
+      name: asString(data.name) || "Facebook Page",
+      connected_at: nowIso(),
+    };
+    await savePage(env, page);
+    return page;
+  }
+
+  const account = await getAccount(env);
+
+  try {
+    const accounts = await graphRequest(env, token, "/me/accounts", {
+      query: { fields: "id,name,instagram_business_account{id}", limit: "100" },
+    });
+    const pages = Array.isArray(accounts.data) ? accounts.data.map(asObject) : [];
+    if (pages.length > 0) {
+      const linked = account
+        ? pages.find(
+            (page) => asString(asObject(page.instagram_business_account).id) === account.user_id,
+          )
+        : undefined;
+      const chosen = linked ?? (pages[0] as JsonObject);
+      const page: PageAccountInfo = {
+        page_id: asString(chosen.id),
+        name: asString(chosen.name) || "Facebook Page",
+        connected_at: nowIso(),
+      };
+      await savePage(env, page);
+      return page;
+    }
+  } catch {
+    /* fall through to /me */
+  }
+
+  // A Page access token (not a user/system-user token) resolves `/me` to the Page.
+  const me = await graphRequest(env, token, "/me", {
+    query: { fields: "id,name,category" },
+  });
+  if (asString(me.id) && asString(me.category)) {
+    const page: PageAccountInfo = {
+      page_id: asString(me.id),
+      name: asString(me.name) || "Facebook Page",
+      connected_at: nowIso(),
+    };
+    await savePage(env, page);
+    return page;
+  }
+
+  throw new GraphApiError(
+    "The token cannot access any Facebook Pages. Add the Page to the token's assets and grant pages_show_list and pages_manage_metadata.",
+    { status: 400 },
+  );
+}
+
 export interface RefreshResult {
   refreshed: boolean;
   reason?: string;
@@ -737,6 +872,78 @@ export async function replyToComment(
 }
 
 /* ------------------------------------------------------------------ */
+/* Facebook Page: comments and Messenger                               */
+/* ------------------------------------------------------------------ */
+
+/** Sends a private reply to a Facebook commenter through Messenger. */
+export async function sendMessengerPrivateReply(
+  env: Env,
+  token: string,
+  pageId: string,
+  commentId: string,
+  text: string,
+): Promise<MessageSendResult> {
+  const data = await graphRequest(env, token, `/${encodeURIComponent(pageId)}/messages`, {
+    method: "POST",
+    body: { recipient: { comment_id: commentId }, message: { text } },
+  });
+
+  return {
+    recipientId: asString(data.recipient_id) || null,
+    messageId: asString(data.message_id) || null,
+  };
+}
+
+/** Sends a standard Messenger message to a Page-scoped id (PSID). */
+export async function sendMessengerMessage(
+  env: Env,
+  token: string,
+  pageId: string,
+  psid: string,
+  text: string,
+): Promise<MessageSendResult> {
+  const data = await graphRequest(env, token, `/${encodeURIComponent(pageId)}/messages`, {
+    method: "POST",
+    body: {
+      recipient: { id: psid },
+      messaging_type: "RESPONSE",
+      message: { text },
+    },
+  });
+
+  return {
+    recipientId: asString(data.recipient_id) || psid,
+    messageId: asString(data.message_id) || null,
+  };
+}
+
+/** Replies publicly under a Facebook comment. */
+export async function replyToFacebookComment(
+  env: Env,
+  token: string,
+  commentId: string,
+  message: string,
+): Promise<void> {
+  await graphRequest(env, token, `/${encodeURIComponent(commentId)}/comments`, {
+    method: "POST",
+    body: { message },
+  });
+}
+
+/** Subscribes the app to a Page's `feed` and `messages` webhooks. */
+export async function subscribePageWebhooks(
+  env: Env,
+  token: string,
+  pageId: string,
+  fields = "feed,messages",
+): Promise<void> {
+  await graphRequest(env, token, `/${encodeURIComponent(pageId)}/subscribed_apps`, {
+    method: "POST",
+    query: { subscribed_fields: fields },
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Media                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -746,6 +953,14 @@ function normalizeMediaType(raw: unknown, product: unknown): MediaRow["media_typ
   const mediaType = String(raw ?? "").toUpperCase();
   if (mediaType === "VIDEO") return "VIDEO";
   if (mediaType === "CAROUSEL_ALBUM") return "CAROUSEL_ALBUM";
+  return "IMAGE";
+}
+
+/** Maps a Facebook Page attachment type onto the shared media type union. */
+function normalizePageMediaType(raw: unknown): MediaRow["media_type"] {
+  const value = String(raw ?? "").toLowerCase();
+  if (value === "video" || value === "reel" || value === "reels") return "VIDEO";
+  if (value === "album" || value === "carousel") return "CAROUSEL_ALBUM";
   return "IMAGE";
 }
 
@@ -783,6 +998,7 @@ export async function fetchRecentMedia(
         thumbnail_url: thumbnail,
         timestamp: typeof item.timestamp === "string" ? item.timestamp : syncedAt,
         synced_at: syncedAt,
+        platform: "instagram",
       };
     })
     .filter((item): item is MediaRow => item !== null);
@@ -792,15 +1008,16 @@ export async function cacheMedia(env: Env, items: MediaRow[]): Promise<void> {
   if (items.length === 0) return;
   const statements = items.map((item) =>
     env.DB.prepare(
-      `INSERT INTO media_cache (media_id, media_type, caption, permalink, thumbnail_url, timestamp, synced_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO media_cache (media_id, media_type, caption, permalink, thumbnail_url, timestamp, synced_at, platform)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(media_id) DO UPDATE SET
          media_type = excluded.media_type,
          caption = excluded.caption,
          permalink = excluded.permalink,
          thumbnail_url = excluded.thumbnail_url,
          timestamp = excluded.timestamp,
-         synced_at = excluded.synced_at`,
+         synced_at = excluded.synced_at,
+         platform = excluded.platform`,
     ).bind(
       item.media_id,
       item.media_type,
@@ -809,7 +1026,56 @@ export async function cacheMedia(env: Env, items: MediaRow[]): Promise<void> {
       item.thumbnail_url,
       item.timestamp,
       item.synced_at,
+      item.platform,
     ),
   );
   await env.DB.batch(statements);
+}
+
+/** Syncs the Page's own posts so Facebook targets can be picked in the UI. */
+export async function fetchPagePosts(
+  env: Env,
+  token: string,
+  pageId: string,
+  limit = 25,
+): Promise<MediaRow[]> {
+  const data = await graphRequest(env, token, `/${encodeURIComponent(pageId)}/posts`, {
+    query: {
+      fields:
+        "id,message,created_time,permalink_url,full_picture,attachments{media_type,media{image}}",
+      limit: String(limit),
+    },
+  });
+
+  const items = Array.isArray(data.data) ? (data.data as JsonObject[]) : [];
+  const syncedAt = nowIso();
+
+  return items
+    .map((item): MediaRow | null => {
+      const postId = String(item.id ?? "").trim();
+      if (!postId) return null;
+
+      const attachments = asObject(item.attachments);
+      const first = Array.isArray(attachments.data) ? asObject(attachments.data[0]) : {};
+      const image = asObject(asObject(first.media).image);
+
+      const thumbnail =
+        typeof item.full_picture === "string" && item.full_picture
+          ? item.full_picture
+          : typeof image.src === "string" && image.src
+            ? image.src
+            : null;
+
+      return {
+        media_id: postId,
+        media_type: normalizePageMediaType(first.media_type),
+        caption: typeof item.message === "string" ? item.message : null,
+        permalink: typeof item.permalink_url === "string" ? item.permalink_url : null,
+        thumbnail_url: thumbnail,
+        timestamp: typeof item.created_time === "string" ? item.created_time : syncedAt,
+        synced_at: syncedAt,
+        platform: "facebook",
+      };
+    })
+    .filter((item): item is MediaRow => item !== null);
 }

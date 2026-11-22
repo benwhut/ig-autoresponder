@@ -73,6 +73,7 @@ label{font-weight:600}
 .check input{width:16px;height:16px;accent-color:var(--accent)}
 .grid.two{display:grid;grid-template-columns:1fr 140px;gap:14px}
 .seg{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.seg.three{grid-template-columns:repeat(3,1fr)}
 .seg.stack{grid-template-columns:1fr}
 .seg-opt{position:relative;display:block;cursor:pointer}
 .seg-opt input{position:absolute;opacity:0;width:0;height:0}
@@ -298,6 +299,7 @@ export function dashboardPage(): string {
         <span id="conn-id"></span>
       </div>
       <span class="pill" id="token-label">—</span>
+      <span class="pill" id="page-label" title="Facebook Page connection">FB —</span>
       <button class="btn tiny" id="btn-refresh-token" title="Ask Meta for a fresh 60-day token (IGAA… tokens only)">Refresh token</button>
       <button class="btn tiny" id="btn-rotate-token">Set token</button>
       <button class="btn tiny ghost" id="btn-logout">Sign out</button>
@@ -309,6 +311,7 @@ export function dashboardPage(): string {
   <button class="tab active" data-tab="rules" role="tab" aria-selected="true">Rules</button>
   <button class="tab" data-tab="posts" role="tab" aria-selected="false">Posts</button>
   <button class="tab" data-tab="activity" role="tab" aria-selected="false">Activity</button>
+  <button class="tab" data-tab="facebook" role="tab" aria-selected="false">Facebook</button>
 </nav>
 
 <main class="wrap">
@@ -359,13 +362,24 @@ export function dashboardPage(): string {
       <table class="logs">
         <thead>
           <tr>
-            <th>When</th><th>Commenter</th><th>Comment</th><th>Rule</th>
+            <th>When</th><th>Platform</th><th>Commenter</th><th>Comment</th><th>Rule</th>
             <th>State</th><th>Public reply</th><th>Error</th><th></th>
           </tr>
         </thead>
         <tbody id="logs-body"></tbody>
       </table>
     </div>
+  </section>
+
+  <section id="tab-facebook" class="tab-panel">
+    <div class="section-head">
+      <div>
+        <h1>Facebook Page</h1>
+        <p class="muted">Connect the Page that crossposts your Instagram reels so Facebook commenters get the same Messenger flow.</p>
+      </div>
+      <button class="btn" id="btn-refresh-page">Refresh</button>
+    </div>
+    <div id="page-card"></div>
   </section>
 </main>
 
@@ -379,6 +393,8 @@ export function dashboardPage(): string {
   var state = {
     account: null,
     token: null,
+    page: null,
+    pageToken: null,
     stats: {},
     queue: {},
     rules: [],
@@ -478,9 +494,12 @@ export function dashboardPage(): string {
     return api('/admin/api/state').then(function (data) {
       state.account = data.account || null;
       state.token = data.token || {};
+      state.page = data.page || null;
+      state.pageToken = data.page_token || null;
       state.stats = data.stats || {};
       state.queue = data.queue || {};
       renderHeader();
+      renderPage();
     }).catch(function (error) { toast(error.message, 'bad'); });
   }
 
@@ -554,6 +573,130 @@ export function dashboardPage(): string {
     label.title = token.never_expires
       ? 'This token does not expire'
       : (token.expires_at ? 'Expires ' + fmtDate(token.expires_at) : '');
+
+    var pageLabel = $('#page-label');
+    if (pageLabel) {
+      if (state.page) {
+        pageLabel.textContent = 'FB ' + (state.page.name || state.page.page_id);
+        pageLabel.className = 'pill ok';
+        pageLabel.title = 'Connected to Facebook Page ' + state.page.page_id;
+      } else {
+        pageLabel.textContent = 'FB —';
+        pageLabel.className = 'pill muted';
+        pageLabel.title = 'No Facebook Page connected';
+      }
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Facebook Page                                                     */
+  /* ---------------------------------------------------------------- */
+
+  function loadPage() {
+    return api('/admin/api/page').then(function (data) {
+      state.page = data.page || null;
+      state.pageToken = data.has_token ? 'configured' : null;
+      renderPage();
+    }).catch(function (error) { toast(error.message, 'bad'); });
+  }
+
+  function renderPage() {
+    var wrap = $('#page-card');
+    if (!wrap) return;
+    var page = state.page;
+    var connected = !!page;
+
+    var status = connected
+      ? '<span class="pill ok">Connected</span>'
+      : '<span class="pill muted">Not connected</span>';
+
+    var details = connected
+      ? '<p class="muted small">Page ID ' + esc(page.page_id) + (page.name ? ' · ' + esc(page.name) : '') + '</p>'
+      : '<p class="muted small">Connect the Facebook Page that owns the crossposted posts. Messenger replies require a Page access token with pages_messaging.</p>';
+
+    wrap.innerHTML = ''
+      + '<div class="rule-card" style="max-width:640px">'
+      + '<div class="rule-top"><div><h3>Facebook Page</h3>' + details + '</div>' + status + '</div>'
+      + '<div class="rule-meta">'
+      + '<span class="pill ' + (state.pageToken ? 'ok' : 'muted') + '">'
+      + (state.pageToken ? 'Page token configured' : 'Using the main token') + '</span>'
+      + '</div>'
+      + '<div class="rule-actions">'
+      + '<button class="btn tiny primary" data-page-action="connect">' + (connected ? 'Reconnect' : 'Connect page') + '</button>'
+      + '<button class="btn tiny" data-page-action="token">Set Page token</button>'
+      + '<button class="btn tiny" data-page-action="subscribe">Subscribe webhooks</button>'
+      + '<button class="btn tiny" data-page-action="sync">Sync Page posts</button>'
+      + (connected ? '<button class="btn tiny danger" data-page-action="disconnect">Disconnect</button>' : '')
+      + '</div>'
+      + '</div>';
+  }
+
+  function pageAction(action) {
+    if (action === 'connect') {
+      api('/admin/api/page/connect', { method: 'POST', body: {} })
+        .then(function (data) {
+          toast('Connected to ' + (data.page && data.page.name ? data.page.name : 'Facebook Page'));
+          loadState();
+          loadMedia();
+        })
+        .catch(function (error) { toast(error.message, 'bad'); });
+      return;
+    }
+    if (action === 'token') {
+      openPageTokenModal();
+      return;
+    }
+    if (action === 'subscribe') {
+      api('/admin/api/page/subscribe', { method: 'POST', body: {} })
+        .then(function () { toast('Webhooks subscribed'); })
+        .catch(function (error) { toast(error.message, 'bad'); });
+      return;
+    }
+    if (action === 'sync') {
+      api('/admin/api/media/sync', { method: 'POST', body: {} })
+        .then(function (data) {
+          toast('Synced ' + (data.instagram || 0) + ' Instagram + ' + (data.facebook || 0) + ' Facebook posts');
+          loadMedia();
+        })
+        .catch(function (error) { toast(error.message, 'bad'); });
+      return;
+    }
+    if (action === 'disconnect') {
+      if (!window.confirm('Disconnect the Facebook Page? Messenger replies will stop.')) return;
+      api('/admin/api/page', { method: 'DELETE' })
+        .then(function () { toast('Page disconnected'); loadState(); })
+        .catch(function (error) { toast(error.message, 'bad'); });
+    }
+  }
+
+  function openPageTokenModal() {
+    openModal(''
+      + '<div class="modal-head"><div><h2>Set Facebook Page token</h2>'
+      + '<p class="muted small">A Page access token (EAA…) with pages_messaging, pages_manage_metadata and pages_read_engagement.</p></div>'
+      + '<button type="button" class="icon-btn" data-close="1" aria-label="Close">✕</button></div>'
+      + '<div class="modal-body"><div class="field"><label for="page-token">Page access token</label>'
+      + '<textarea id="page-token" rows="4" placeholder="EAA…"></textarea>'
+      + '<p class="hint">Stored encrypted with AES-256-GCM. Use this when the main token cannot act as the Page.</p></div>'
+      + '<div class="modal-foot"><button type="button" class="btn ghost" data-close="1">Cancel</button>'
+      + '<button type="button" class="btn primary" id="btn-save-page-token">Validate &amp; save</button></div></div>');
+    $('#btn-save-page-token').addEventListener('click', function () {
+      var value = ($('#page-token').value || '').trim();
+      if (!value) return toast('Paste a Page token first', 'bad');
+      var button = $('#btn-save-page-token');
+      button.disabled = true;
+      button.textContent = 'Validating…';
+      api('/admin/api/page/token', { method: 'POST', body: { token: value } })
+        .then(function (data) {
+          closeModal();
+          toast('Page token saved' + (data.page && data.page.name ? ' for ' + data.page.name : ''));
+          loadState();
+        })
+        .catch(function (error) {
+          toast(error.message, 'bad');
+          button.disabled = false;
+          button.textContent = 'Validate & save';
+        });
+    });
   }
 
   /* ---------------------------------------------------------------- */
@@ -572,6 +715,7 @@ export function dashboardPage(): string {
     });
     if (name === 'activity') loadLogs();
     if (name === 'posts') loadMedia();
+    if (name === 'facebook') loadPage();
   }
 
   /* ---------------------------------------------------------------- */
@@ -627,6 +771,9 @@ export function dashboardPage(): string {
         + '</div>'
         + '<div class="rule-chips">' + keywordChips + '</div>'
         + '<div class="rule-meta">'
+        + '<span class="pill ' + (rule.platform === 'both' ? 'info' : 'muted') + '">'
+        + (rule.platform === 'both' ? 'Instagram + Facebook' : rule.platform === 'facebook' ? 'Facebook' : 'Instagram')
+        + '</span>'
         + '<span class="pill ' + (rule.delivery_mode === 'two_step_opt_in' ? 'info' : 'ok') + '">'
         + (rule.delivery_mode === 'two_step_opt_in' ? 'Two-step opt-in' : 'Direct link')
         + '</span>'
@@ -697,6 +844,7 @@ export function dashboardPage(): string {
       id: rule ? rule.id : null,
       name: source ? (rule ? source.name : source.name + ' (copy)') : '',
       enabled: source ? !!source.enabled : true,
+      platform: source ? source.platform : 'both',
       target_mode: presetMediaIds && presetMediaIds.length ? 'specific_posts' : (source ? source.target_mode : 'all_posts'),
       media_ids: presetMediaIds && presetMediaIds.length ? presetMediaIds.slice() : (source ? source.media_ids.slice() : []),
       match_mode: source ? source.match_mode : 'any_keyword',
@@ -735,6 +883,15 @@ export function dashboardPage(): string {
       + '<div class="field"><label for="rule-priority">Priority</label>'
       + '<input id="rule-priority" type="number" min="-1000" max="1000" step="1" title="Higher wins when several rules match. Post-specific rules always beat global rules."></div>'
       + '</div>'
+
+      + '<div class="field"><span class="label">Platform</span><div class="seg three">'
+      + '<label class="seg-opt"><input type="radio" name="platform" value="instagram">'
+      + '<span><strong>Instagram</strong><small>Instagram comments</small></span></label>'
+      + '<label class="seg-opt"><input type="radio" name="platform" value="facebook">'
+      + '<span><strong>Facebook</strong><small>Facebook Page comments</small></span></label>'
+      + '<label class="seg-opt"><input type="radio" name="platform" value="both">'
+      + '<span><strong>Both</strong><small>Instagram + Facebook</small></span></label>'
+      + '</div></div>'
 
       + '<div class="field"><span class="label">Target</span><div class="seg">'
       + '<label class="seg-opt"><input type="radio" name="target_mode" value="all_posts">'
@@ -827,6 +984,14 @@ export function dashboardPage(): string {
       input.addEventListener('change', function () {
         draft.target_mode = input.value;
         renderTargetPanels();
+      });
+    });
+
+    $all('input[name="platform"]').forEach(function (input) {
+      input.checked = input.value === draft.platform;
+      input.addEventListener('change', function () {
+        draft.platform = input.value;
+        renderMediaPicker();
       });
     });
 
@@ -1005,7 +1170,9 @@ export function dashboardPage(): string {
     var wrap = $('#media-picker');
     if (!wrap) return;
     var search = ($('#media-search') && $('#media-search').value || '').trim().toLowerCase();
+    var platform = draft.platform || 'both';
     var items = state.media.filter(function (media) {
+      if (platform !== 'both' && media.platform !== platform) return false;
       if (!search) return true;
       return media.media_id.toLowerCase().indexOf(search) !== -1
         || String(media.caption || '').toLowerCase().indexOf(search) !== -1;
@@ -1063,6 +1230,7 @@ export function dashboardPage(): string {
     var payload = {
       name: ($('#rule-name').value || '').trim(),
       enabled: $('#rule-enabled').checked,
+      platform: draft.platform,
       target_mode: draft.target_mode,
       media_ids: draft.media_ids.slice(),
       match_mode: draft.match_mode,
@@ -1138,10 +1306,11 @@ export function dashboardPage(): string {
 
     grid.innerHTML = state.media.map(function (media) {
       var permalink = safeUrl(media.permalink);
+      var platform = media.platform === 'facebook' ? 'Facebook' : 'Instagram';
       return '<article class="post-card">'
         + thumbHtml(media, 'lg')
         + '<div class="post-body">'
-        + '<div class="post-top"><span class="pill muted">' + esc(media.media_type) + '</span>'
+        + '<div class="post-top"><span class="pill ' + (media.platform === 'facebook' ? 'info' : 'muted') + '">' + esc(platform) + ' · ' + esc(media.media_type) + '</span>'
         + '<span class="muted small">' + esc(fmtDate(media.timestamp)) + '</span></div>'
         + '<p class="post-caption">' + esc(media.caption || 'No caption') + '</p>'
         + '<div class="post-actions">'
@@ -1157,7 +1326,7 @@ export function dashboardPage(): string {
     buttons.forEach(function (button) { button.disabled = true; button.textContent = 'Syncing…'; });
     api('/admin/api/media/sync', { method: 'POST', body: {} })
       .then(function (data) {
-        toast('Synced ' + (data.synced || 0) + ' posts');
+        toast('Synced ' + (data.instagram || 0) + ' Instagram + ' + (data.facebook || 0) + ' Facebook posts');
         return loadMedia();
       })
       .catch(function (error) { toast(error.message, 'bad'); })
@@ -1197,18 +1366,20 @@ export function dashboardPage(): string {
   function renderLogs() {
     var body = $('#logs-body');
     if (!state.logs.length) {
-      body.innerHTML = '<tr><td colspan="8" class="empty-cell">No activity yet. Comments will appear here as soon as Instagram delivers them.</td></tr>';
+      body.innerHTML = '<tr><td colspan="9" class="empty-cell">No activity yet. Comments will appear here as soon as Instagram or Facebook delivers them.</td></tr>';
       return;
     }
 
     body.innerHTML = state.logs.map(function (row) {
       var canRetry = row.state === 'failed' || row.job_status === 'failed';
+      var profileHost = row.platform === 'facebook' ? 'https://facebook.com/' : 'https://instagram.com/';
       var user = row.commenter_username
-        ? '<a href="https://instagram.com/' + encodeURIComponent(row.commenter_username) + '" target="_blank" rel="noopener">@' + esc(row.commenter_username) + '</a>'
+        ? '<a href="' + profileHost + encodeURIComponent(row.commenter_username) + '" target="_blank" rel="noopener">' + esc(row.commenter_username) + '</a>'
         : '<span class="muted">' + esc(row.commenter_igsid) + '</span>';
 
       return '<tr>'
         + '<td class="nowrap" title="' + esc(row.created_at) + '">' + esc(timeAgo(row.created_at)) + '</td>'
+        + '<td>' + platformBadge(row.platform) + '</td>'
         + '<td>' + user + '</td>'
         + '<td class="comment-cell" title="' + esc(row.comment_text) + '">' + esc(shortText(row.comment_text, 90)) + '</td>'
         + '<td>' + (row.rule_name ? esc(row.rule_name) : '<span class="muted">—</span>') + '</td>'
@@ -1219,6 +1390,11 @@ export function dashboardPage(): string {
         + '<td>' + (canRetry ? '<button class="btn tiny" data-retry="' + esc(row.comment_id) + '">Retry</button>' : '') + '</td>'
         + '</tr>';
     }).join('');
+  }
+
+  function platformBadge(platform) {
+    if (platform === 'facebook') return '<span class="pill info">Facebook</span>';
+    return '<span class="pill muted">Instagram</span>';
   }
 
   function retryComment(commentId, button) {
@@ -1310,6 +1486,13 @@ export function dashboardPage(): string {
   $('#btn-refresh-token').addEventListener('click', refreshTokenNow);
   $('#btn-sync-posts').addEventListener('click', syncPosts);
   $('#btn-refresh-logs').addEventListener('click', loadLogs);
+  $('#btn-refresh-page').addEventListener('click', loadPage);
+
+  $('#page-card').addEventListener('click', function (event) {
+    var button = event.target.closest('[data-page-action]');
+    if (!button) return;
+    pageAction(button.getAttribute('data-page-action'));
+  });
 
   $('#btn-logout').addEventListener('click', function () {
     fetch('/admin/logout', { method: 'POST', credentials: 'same-origin' })

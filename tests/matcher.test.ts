@@ -7,6 +7,7 @@ function makeRule(overrides: Partial<Rule> = {}): Rule {
   return {
     id: "rule_1",
     name: "Rule",
+    platform: "both",
     target_mode: "all_posts",
     media_ids: [],
     match_mode: "any_keyword",

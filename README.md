@@ -1,8 +1,10 @@
-# Instagram Comment → DM Autoresponder
+# Instagram + Facebook Comment → DM Autoresponder
 
-A single-tenant, zero-cost Instagram comment autoresponder that runs entirely on **Cloudflare Workers + D1 + Cron Triggers**, with a password-protected admin dashboard served by the Worker itself.
+A single-tenant, zero-cost comment autoresponder that runs entirely on **Cloudflare Workers + D1 + Cron Triggers**, with a password-protected admin dashboard served by the Worker itself.
 
-When someone comments a keyword on your post or reel, the Worker sends a private reply. In the default **two-step opt-in** mode it asks the user to reply first, then delivers the clean `https://` link in a second DM — so the link is clickable even when the first message lands in Message Requests. A **direct link** mode sends everything in the first private reply.
+When someone comments a keyword on your Instagram post or reel, the Worker sends a private reply. In the default **two-step opt-in** mode it asks the user to reply first, then delivers the clean `https://` link in a second DM — so the link is clickable even when the first message lands in Message Requests. A **direct link** mode sends everything in the first private reply.
+
+The same workflow works on a **Facebook Page** when an Instagram reel is crossposted: Facebook comments get a Messenger private reply, and the follow-up is sent as a Messenger message after the commenter replies. Rules can target Instagram, Facebook, or both.
 
 No Facebook Page is required for the Instagram Login (`IGAA…`) flow; Meta Business/System User (`EAA…`) tokens are also supported. No OAuth SaaS onboarding, no Redis, no external queue, no third-party hosting.
 
@@ -10,16 +12,17 @@ No Facebook Page is required for the Instagram Login (`IGAA…`) flow; Meta Busi
 
 ## What it does
 
-- **Webhook ingestion** — `GET /webhook` verification + `POST /webhook` with `X-Hub-Signature-256` HMAC verification.
-- **Rule matching** — keywords are matched as whole words/phrases, case- and punctuation-insensitive. Rules can target **all posts** or **specific posts/reels**.
+- **Webhook ingestion** — `GET /webhook` verification + `POST /webhook` with `X-Hub-Signature-256` HMAC verification. Handles Instagram comments/DMs and Facebook Page `feed`/`messages` webhooks.
+- **Rule matching** — keywords are matched as whole words/phrases, case- and punctuation-insensitive. Rules can target **all posts** or **specific posts/reels**, on Instagram, Facebook, or both.
 - **Rule precedence** — post-specific rules always beat global rules; then `priority DESC`, then `updated_at DESC`.
 - **Two delivery modes** — `two_step_opt_in` (default) and `direct_link`.
 - **Optional public comment replies** — a random variant from a list, posted 3 seconds after the private reply.
+- **Cross-platform delivery** — Instagram uses the Instagram Graph API; Facebook uses Messenger (`/{page_id}/messages`) with the commenter's PSID.
 - **D1 job queue** — idempotent enqueue, atomic claim, exponential backoff, 1-minute cron safety net, plus an inline drain on webhook receipt so DMs go out in ~1–2 seconds.
-- **Encrypted token storage** — the Instagram token (IGAA… or EAA…) is encrypted with AES-256-GCM (Web Crypto) before it touches D1.
+- **Encrypted token storage** — the Instagram token (IGAA… or EAA…) and an optional Page token are encrypted with AES-256-GCM (Web Crypto) before they touch D1.
 - **Token host auto-detection** — `IGAA…` tokens use `graph.instagram.com`; `EAA…` Business/System User tokens use `graph.facebook.com` and are resolved to an Instagram business account.
 - **Zero-touch token refresh** — a daily cron refreshes 60-day IGAA tokens when they have less than 30 days left. Non-expiring EAA System User tokens are left alone and shown as “Never expires”.
-- **Admin dashboard** — rules CRUD, post sync + visual picker, token health/rotation, searchable delivery logs, failed-job retry.
+- **Admin dashboard** — rules CRUD, post sync + visual picker, Facebook Page connection, token health/rotation, searchable delivery logs with platform badges, failed-job retry.
 
 ---
 
@@ -41,7 +44,8 @@ No Facebook Page is required for the Instagram Login (`IGAA…`) flow; Meta Busi
 ├── migrations/
 │   ├── 0001_init.sql
 │   ├── 0002_recipient_igsid.sql
-│   └── 0003_webhook_events.sql
+│   ├── 0003_webhook_events.sql
+│   └── 0004_facebook_pages.sql
 ├── src/
 │   ├── index.ts          # HTTP router, webhook, admin API, scheduled handler
 │   ├── meta.ts           # HMAC, Graph API client, AES-GCM token storage, refresh
@@ -56,6 +60,7 @@ No Facebook Page is required for the Instagram Login (`IGAA…`) flow; Meta Busi
 │   ├── flow.test.ts
 │   ├── meta.test.ts
 │   ├── inbound-dm.test.ts
+│   ├── facebook.test.ts
 │   ├── auth.test.ts
 │   ├── ui.test.ts
 │   ├── helpers.ts
@@ -97,6 +102,29 @@ While the app is in **Development** mode, only Instagram accounts with a role on
 
 For use by accounts you do not own, request **Advanced Access** for the three permissions in **App Review** and switch the app to **Live**. This project is intentionally single-tenant, so the simplest setup is your own professional account + Development mode.
 
+### Facebook Page setup (optional)
+
+Do this only if you want Facebook commenters on crossposted reels to get the same Messenger flow.
+
+1. **Use a token that can access the Page.** Either the same `EAA…` System User token with the Page asset, or a **Page access token** generated from the Page.
+2. **Grant the Page permissions:**
+   - `pages_show_list`
+   - `pages_read_engagement`
+   - `pages_manage_metadata` (subscribe the Page to webhooks)
+   - `pages_messaging` (private replies + Messenger sends)
+   - `pages_manage_engagement` (public comment replies)
+3. **Deploy the Worker** (section 2), then open the admin dashboard → **Facebook** tab:
+   - **Connect page** — resolves the Page linked to your Instagram account and stores its id.
+   - **Set Page token** — only needed when the main token cannot act as the Page.
+   - **Subscribe webhooks** — calls `POST /{page_id}/subscribed_apps?subscribed_fields=feed,messages`.
+   - **Sync Page posts** — pulls the Page's own posts into the post picker.
+4. **Subscribe the app to the Page object** in the app dashboard:
+   - **Webhooks** → **Page** → subscribe to **`feed`** and **`messages`**.
+   - Reuse the same callback URL and verify token.
+5. **Add a rule** with the platform set to **Facebook** or **Both**.
+
+Facebook commenters are Page-scoped ids (PSIDs), not Instagram ids. Meta does not expose a Facebook commenter's Instagram id, so the Facebook path uses Messenger only.
+
 ---
 
 ## 2. Cloudflare setup
@@ -125,7 +153,7 @@ migrations_dir = "migrations"
 npx wrangler d1 migrations apply DB --remote
 ```
 
-(Applies every file in `migrations/` in order, including `0002_recipient_igsid.sql` (opt-in recipient id) and `0003_webhook_events.sql` (webhook diagnostics).)
+(Applies every file in `migrations/` in order, including `0002_recipient_igsid.sql` (opt-in recipient id), `0003_webhook_events.sql` (webhook diagnostics), and `0004_facebook_pages.sql` (platform columns for rules, executions, jobs and media).)
 
 ### Set secrets
 
@@ -210,14 +238,21 @@ A valid request returns `EVENT_RECEIVED`. A bad signature returns `401` and logs
 
 ### Webhook payload shapes
 
-Meta delivers Instagram DMs in two shapes; the Worker normalises both into one handler:
+Meta delivers DMs in two shapes; the Worker normalises both into one handler:
 
 | Shape | Typical source | Event object |
 | --- | --- | --- |
-| `entry[].messaging[]` | Instagram Login, some Page-linked deliveries | `{ sender, recipient, message }` |
+| `entry[].messaging[]` | Instagram Login, Messenger, some Page-linked deliveries | `{ sender, recipient, message }` |
 | `entry[].changes[]` with `field: "messages"` | Facebook Graph / Page-linked Instagram | `{ value: { sender, recipient, message } }` |
 
-`object` may be `"instagram"` or `"page"`. Comments continue to arrive as `entry[].changes[]` with `field: "comments"`.
+Comments arrive as `entry[].changes[]`:
+
+| Platform | `object` | `field` | Comment fields |
+| --- | --- | --- | --- |
+| Instagram | `"instagram"` | `"comments"` | `id`, `text`, `from.id`, `media.id`, `parent_id` |
+| Facebook Page | `"page"` | `"feed"` (or `"comments"`) | `comment_id`, `message`, `from.id`, `post_id`, `item: "comment"`, `verb: "add"` |
+
+For DMs, the platform is taken from the matched `comment_executions` row, not the webhook object — so a Page-linked Instagram DM still replies through Instagram, and a Messenger DM replies through Messenger.
 
 Every delivery logs `webhook received <json>` and each DM decision logs `inbound dm { senderId, recipientId, text, matchedSessionId, reason, source, entryId }`. Recent payloads and decisions are stored in `webhook_events` and returned by `GET /admin/api/logs` as `events` (last 50, pruned after 7 days), so you can inspect them without `wrangler tail`.
 
@@ -227,15 +262,17 @@ Every delivery logs `webhook received <json>` and each DM decision logs `inbound
 
 For every top-level comment (replies to comments are ignored):
 
-1. Ignore comments written by the account itself.
+1. Ignore comments written by the account itself (or the Page itself on Facebook).
 2. If `comment_id` already exists in `comment_executions`, stop — webhook retries are no-ops.
-3. Resolve the rule:
+3. Drop rules whose `platform` is neither `both` nor the comment's platform.
+4. Resolve the rule:
    - Enabled rules that target this exact `media_id`, sorted by `priority DESC, updated_at DESC`
    - Then enabled `all_posts` rules, same ordering
-4. Match the comment text:
+   - Facebook targets accept both `<page_id>_<post_id>` and the bare `<post_id>`
+5. Match the comment text:
    - `any_keyword`: normalized text must contain the keyword/phrase as whole words
    - `any_comment`: every top-level comment matches
-5. Insert the execution row + `private_reply` job (+ `public_reply` job with `run_after = now + 3s` if variants exist) in one D1 batch.
+6. Insert the execution row + `private_reply` job (+ `public_reply` job with `run_after = now + 3s` if variants exist) in one D1 batch.
 
 Keyword normalization lowercases, applies Unicode NFKC, and replaces punctuation runs with spaces:
 
@@ -381,13 +418,16 @@ npm run db:migrate:local # apply schema to local D1
 npm run db:migrate:remote
 ```
 
-The test suite uses Node's built-in SQLite through a small D1 adapter, so it exercises real SQL (`ON CONFLICT`, `RETURNING`, batches) without downloading a Workers runtime. 86 tests cover:
+The test suite uses Node's built-in SQLite through a small D1 adapter, so it exercises real SQL (`ON CONFLICT`, `RETURNING`, batches) without downloading a Workers runtime. 98 tests cover:
 
 - HMAC signature verification, handshake, echo filtering, duplicate comment idempotency
 - whole-word/phrase keyword matching, post-specific vs. global precedence, priority ordering
 - two-step opt-in transitions, opt-in keywords, 24-hour window, duplicate DM suppression
 - private-reply `recipient_id` capture, inbound DM matching on either id, structured skip/match logs
 - both DM webhook shapes (`entry[].messaging[]` and `entry[].changes[]` with `field: "messages"`), `object: "page"` deliveries
+- Facebook `feed` comments → Messenger private reply → PSID capture → Messenger follow-up, public replies on Facebook
+- platform filtering (Instagram-only rules ignore Facebook comments and vice versa), specific Page post targets (full and bare ids)
+- Page connection, `/admin/api/state` Page reporting, Page post sync into the media cache
 - cron-drain Step 1 capture, `/admin/api/logs` webhook events, signature-failure logging
 - direct-link mode, public reply variants, retry/backoff, permanent-error handling
 - login throttling, session tampering, CSRF guard, token encryption at rest, media sync
@@ -406,6 +446,11 @@ The test suite uses Node's built-in SQLite through a small D1 adapter, so it exe
 | No DMs sent | Check Activity → error. Common: token missing/expired, private reply already used, comment older than 7 days, 24-hour window closed |
 | Step 1 arrives but replying “YES” does nothing | Check `wrangler tail` for `inbound dm`. `reason: "no_pending_opt_in"` means the reply did not match the 24-hour session; `reason: "no_text"`/`"echo"` means Meta sent a non-text or echo event. Recent payloads are in `GET /admin/api/logs` under `events` (run migration `0003`) |
 | `/admin/api/logs` has no `events` | Apply `npx wrangler d1 migrations apply DB --remote` for `0003_webhook_events.sql` |
+| Facebook comments do nothing | Open the **Facebook** tab: connect the Page, subscribe webhooks, sync Page posts. In the app dashboard subscribe the **Page** object to `feed` and `messages`, and grant `pages_messaging`, `pages_manage_metadata`, `pages_read_engagement` |
+| `outbound job failed` with `Facebook Page is not connected` | Connect the Page in the **Facebook** tab (or reconnect it) |
+| Messenger send fails with a permissions error | The token must have the Page asset and `pages_messaging`; use a Page token in **Set Page token** if the main token cannot act as the Page |
+| `no such column: platform` | Apply `0004_facebook_pages.sql` |
+| Facebook commenter gets no DM | Facebook commenters are PSIDs; the Facebook path uses Messenger, not Instagram DMs |
 | Links are not clickable | Expected for the first DM to non-followers. Use two-step opt-in |
 | Token refresh returns 400 | Token is less than 24 hours old, already refreshed, or invalid. Paste a new token |
 | “Business/System User tokens do not support refresh” | Expected for EAA tokens. Manage them in Meta Business Suite; the Worker does not refresh them |
@@ -423,10 +468,12 @@ If Meta retires `v25.0`, update the `GRAPH_API_VERSION` variable in `wrangler.to
 
 ### Limitations
 
-- Single tenant: one Instagram account per deployment.
+- Single tenant: one Instagram account and, optionally, one Facebook Page per deployment.
 - The login throttle is in-memory per Worker isolate; it is a basic speed bump, not a distributed rate limiter.
 - Media cache is refreshed manually (or by the dashboard’s sync button); old cached posts remain selectable.
 - Instagram API rate limits and messaging policies still apply.
+- Facebook commenters are Page-scoped ids. Meta does not expose their Instagram id, so the Facebook path always sends a Messenger message, never an Instagram DM.
+- Crossposted posts are separate Facebook posts, so a Facebook-targeted “specific posts” rule needs the Facebook post id (or use “All posts”).
 - Public replies are sent by the cron, so their timing is approximate.
 
 ---

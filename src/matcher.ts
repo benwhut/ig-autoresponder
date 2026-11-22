@@ -1,4 +1,4 @@
-import type { Rule } from "./types";
+import type { Platform, Rule } from "./types";
 
 /**
  * Normalizes text for keyword matching:
@@ -44,14 +44,38 @@ export function sortRules(rules: readonly Rule[]): Rule[] {
   });
 }
 
-export function ruleAppliesToMedia(rule: Rule, mediaId: string): boolean {
+/** A rule serves a platform when it targets that platform or both. */
+export function ruleAppliesToPlatform(rule: Rule, platform: Platform): boolean {
+  return rule.platform === "both" || rule.platform === platform;
+}
+
+/**
+ * A Facebook comment's `post_id` is `<page_id>_<post_id>`; some deliveries
+ * only carry the bare post id. Accept either form when matching targets,
+ * but never match across different Pages.
+ */
+export function postIdMatches(target: string, mediaId: string): boolean {
+  if (target === mediaId) return true;
+  return target.endsWith(`_${mediaId}`) || mediaId.endsWith(`_${target}`);
+}
+
+export function ruleAppliesToMedia(rule: Rule, mediaId: string, platform: Platform = "instagram"): boolean {
   if (rule.target_mode === "all_posts") return true;
+  if (platform === "facebook") {
+    return rule.media_ids.some((target) => postIdMatches(target, mediaId));
+  }
   return rule.media_ids.includes(mediaId);
 }
 
-export function matchesRule(rule: Rule, mediaId: string, commentText: string): boolean {
+export function matchesRule(
+  rule: Rule,
+  mediaId: string,
+  commentText: string,
+  platform: Platform = "instagram",
+): boolean {
   if (!rule.enabled) return false;
-  if (!ruleAppliesToMedia(rule, mediaId)) return false;
+  if (!ruleAppliesToPlatform(rule, platform)) return false;
+  if (!ruleAppliesToMedia(rule, mediaId, platform)) return false;
   if (rule.match_mode === "any_comment") return true;
   return findMatchingKeyword(commentText, rule.keywords) !== null;
 }
@@ -64,24 +88,31 @@ export function matchesRule(rule: Rule, mediaId: string, commentText: string): b
  *  2. All-posts rules (priority DESC, updated_at DESC)
  *
  * A global rule with a higher `priority` number never outranks a rule that
- * explicitly targets the post.
+ * explicitly targets the post. Rules are filtered by platform first, so an
+ * Instagram-only rule never fires on a Facebook comment.
  */
 export function pickRule(
   rules: readonly Rule[],
   mediaId: string,
   commentText: string,
+  platform: Platform = "instagram",
 ): Rule | null {
   const ordered = sortRules(rules);
   const specific = ordered.filter(
-    (rule) => rule.target_mode === "specific_posts" && rule.media_ids.includes(mediaId),
+    (rule) =>
+      ruleAppliesToPlatform(rule, platform) &&
+      rule.target_mode === "specific_posts" &&
+      ruleAppliesToMedia(rule, mediaId, platform),
   );
-  const global = ordered.filter((rule) => rule.target_mode === "all_posts");
+  const global = ordered.filter(
+    (rule) => ruleAppliesToPlatform(rule, platform) && rule.target_mode === "all_posts",
+  );
 
   for (const rule of specific) {
-    if (matchesRule(rule, mediaId, commentText)) return rule;
+    if (matchesRule(rule, mediaId, commentText, platform)) return rule;
   }
   for (const rule of global) {
-    if (matchesRule(rule, mediaId, commentText)) return rule;
+    if (matchesRule(rule, mediaId, commentText, platform)) return rule;
   }
   return null;
 }

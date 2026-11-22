@@ -1,9 +1,14 @@
 import {
   GraphApiError,
   getAccount,
+  getPage,
+  getPageToken,
   getToken,
   replyToComment,
+  replyToFacebookComment,
   sendDirectMessage,
+  sendMessengerMessage,
+  sendMessengerPrivateReply,
   sendPrivateReply,
 } from "./meta";
 import type {
@@ -12,9 +17,10 @@ import type {
   Env,
   JobType,
   OutboundJobRow,
+  Platform,
   PrivateReplyPayload,
 } from "./types";
-import { nowIso, truncate } from "./types";
+import { nowIso, toPlatform, truncate } from "./types";
 
 const STALE_PROCESSING_MS = 5 * 60 * 1000;
 const CLAIM_BATCH = 10;
@@ -27,6 +33,35 @@ export interface EnqueueJobInput {
   recipientIgsid?: string | null;
   payload: Record<string, unknown>;
   runAfter?: Date;
+  /** Which send API the job must use. Defaults to Instagram. */
+  platform?: Platform;
+}
+
+/** Credentials resolved once per drain, then reused for every job. */
+export interface SendContext {
+  instagram: { token: string; igUserId: string | null } | null;
+  facebook: { token: string; pageId: string } | null;
+}
+
+export async function loadSendContext(env: Env): Promise<SendContext> {
+  const [igToken, account, pageToken, page] = await Promise.all([
+    getToken(env),
+    getAccount(env),
+    getPageToken(env),
+    getPage(env),
+  ]);
+
+  return {
+    instagram: igToken ? { token: igToken, igUserId: account?.user_id ?? null } : null,
+    facebook: pageToken && page ? { token: pageToken, pageId: page.page_id } : null,
+  };
+}
+
+function configuredPlatforms(context: SendContext): Platform[] {
+  const platforms: Platform[] = [];
+  if (context.instagram) platforms.push("instagram");
+  if (context.facebook) platforms.push("facebook");
+  return platforms;
 }
 
 /**
@@ -37,8 +72,8 @@ export async function enqueueJob(env: Env, input: EnqueueJobInput): Promise<bool
   const now = nowIso();
   const result = await env.DB.prepare(
     `INSERT INTO outbound_jobs
-       (id, job_type, comment_id, recipient_igsid, payload_json, status, attempts, max_attempts, run_after, last_error, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'queued', 0, 5, ?, NULL, ?, ?)
+       (id, job_type, comment_id, recipient_igsid, platform, payload_json, status, attempts, max_attempts, run_after, last_error, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, 5, ?, NULL, ?, ?)
      ON CONFLICT(comment_id, job_type) DO NOTHING`,
   )
     .bind(
@@ -46,6 +81,7 @@ export async function enqueueJob(env: Env, input: EnqueueJobInput): Promise<bool
       input.jobType,
       input.commentId,
       input.recipientIgsid ?? null,
+      input.platform ?? "instagram",
       JSON.stringify(input.payload),
       (input.runAfter ?? new Date()).toISOString(),
       now,
@@ -142,14 +178,85 @@ type JobOutcome = "sent" | "retried" | "failed";
 
 async function processJob(
   env: Env,
-  token: string,
-  igUserId: string | null,
+  context: SendContext,
   job: OutboundJobRow,
   now: string,
 ): Promise<JobOutcome> {
   const payload = parsePayload(job.payload_json);
+  const platform = toPlatform(job.platform);
 
   try {
+    if (platform === "facebook") {
+      const page = context.facebook;
+      if (!page) {
+        throw new GraphApiError("Facebook Page is not connected", { status: 400 });
+      }
+
+      if (job.job_type === "private_reply") {
+        const privatePayload = payload as unknown as PrivateReplyPayload;
+        const text = typeof privatePayload.text === "string" ? privatePayload.text : "";
+        if (!text.trim()) throw new GraphApiError("Private reply text is empty", { status: 400 });
+
+        const execution = await getExecution(env, job.comment_id);
+        if (!execution) {
+          throw new GraphApiError("Comment execution row is missing", { status: 400 });
+        }
+
+        const { recipientId, messageId } = await sendMessengerPrivateReply(
+          env,
+          page.token,
+          page.pageId,
+          job.comment_id,
+          text,
+        );
+
+        const optInRecipient = recipientId ?? execution.commenter_igsid;
+        const deliveryMode: DeliveryMode =
+          privatePayload.delivery_mode === "direct_link" ? "direct_link" : "two_step_opt_in";
+
+        console.log("private reply sent", {
+          platform,
+          commentId: job.comment_id,
+          messageId,
+          recipientId,
+          optInRecipient,
+          deliveryMode,
+        });
+
+        await finishPrivateReply(env, job, now, optInRecipient, deliveryMode);
+        return "sent";
+      }
+
+      if (job.job_type === "public_reply") {
+        const text = typeof payload.text === "string" ? payload.text : "";
+        if (!text.trim()) throw new GraphApiError("Public reply text is empty", { status: 400 });
+
+        await replyToFacebookComment(env, page.token, job.comment_id, text);
+        await markPublicReplySent(env, job, now);
+        return "sent";
+      }
+
+      if (job.job_type === "followup_dm") {
+        const text = typeof payload.text === "string" ? payload.text : "";
+        const recipient =
+          job.recipient_igsid ??
+          (typeof payload.recipient_igsid === "string" ? payload.recipient_igsid : "");
+        if (!recipient) throw new GraphApiError("Follow-up DM has no recipient", { status: 400 });
+        if (!text.trim()) throw new GraphApiError("Follow-up DM text is empty", { status: 400 });
+
+        await sendMessengerMessage(env, page.token, page.pageId, recipient, text);
+        await markFollowupSent(env, job, now);
+        return "sent";
+      }
+
+      throw new GraphApiError(`Unknown job type: ${String(job.job_type)}`, { status: 400 });
+    }
+
+    const ig = context.instagram;
+    if (!ig) {
+      throw new GraphApiError("Instagram token is not configured", { status: 400 });
+    }
+
     if (job.job_type === "private_reply") {
       const privatePayload = payload as unknown as PrivateReplyPayload;
       const text = typeof privatePayload.text === "string" ? privatePayload.text : "";
@@ -162,8 +269,8 @@ async function processJob(
 
       const { recipientId, messageId } = await sendPrivateReply(
         env,
-        token,
-        igUserId,
+        ig.token,
+        ig.igUserId,
         job.comment_id,
         text,
       );
@@ -172,11 +279,11 @@ async function processJob(
       // messaging events identify the same user as `messaging.sender.id`, so
       // persist it for the opt-in handshake (falling back to the commenter id).
       const optInRecipient = recipientId ?? execution.commenter_igsid;
-
       const deliveryMode: DeliveryMode =
         privatePayload.delivery_mode === "direct_link" ? "direct_link" : "two_step_opt_in";
 
       console.log("private reply sent", {
+        platform,
         commentId: job.comment_id,
         messageId,
         recipientId,
@@ -184,33 +291,7 @@ async function processJob(
         deliveryMode,
       });
 
-      if (deliveryMode === "two_step_opt_in") {
-        await env.DB.batch([
-          env.DB.prepare(
-            "UPDATE outbound_jobs SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
-          ).bind(now, job.id),
-          env.DB.prepare(
-            `UPDATE comment_executions
-             SET state = 'awaiting_opt_in', private_reply_sent_at = ?,
-                 recipient_igsid = COALESCE(?, recipient_igsid),
-                 last_error = NULL, updated_at = ?
-             WHERE comment_id = ?`,
-          ).bind(now, optInRecipient, now, job.comment_id),
-        ]);
-      } else {
-        await env.DB.batch([
-          env.DB.prepare(
-            "UPDATE outbound_jobs SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
-          ).bind(now, job.id),
-          env.DB.prepare(
-            `UPDATE comment_executions
-             SET state = 'completed', private_reply_sent_at = ?, opt_in_completed_at = ?,
-                 recipient_igsid = COALESCE(?, recipient_igsid),
-                 last_error = NULL, updated_at = ?
-             WHERE comment_id = ?`,
-          ).bind(now, now, optInRecipient, now, job.comment_id),
-        ]);
-      }
+      await finishPrivateReply(env, job, now, optInRecipient, deliveryMode);
       return "sent";
     }
 
@@ -218,38 +299,21 @@ async function processJob(
       const text = typeof payload.text === "string" ? payload.text : "";
       if (!text.trim()) throw new GraphApiError("Public reply text is empty", { status: 400 });
 
-      await replyToComment(env, token, job.comment_id, text);
-
-      await env.DB.batch([
-        env.DB.prepare(
-          "UPDATE outbound_jobs SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
-        ).bind(now, job.id),
-        env.DB.prepare(
-          "UPDATE comment_executions SET public_reply_status = 'sent', updated_at = ? WHERE comment_id = ?",
-        ).bind(now, job.comment_id),
-      ]);
+      await replyToComment(env, ig.token, job.comment_id, text);
+      await markPublicReplySent(env, job, now);
       return "sent";
     }
 
     if (job.job_type === "followup_dm") {
       const text = typeof payload.text === "string" ? payload.text : "";
-      const recipient = job.recipient_igsid ?? (typeof payload.recipient_igsid === "string" ? payload.recipient_igsid : "");
+      const recipient =
+        job.recipient_igsid ??
+        (typeof payload.recipient_igsid === "string" ? payload.recipient_igsid : "");
       if (!recipient) throw new GraphApiError("Follow-up DM has no recipient", { status: 400 });
       if (!text.trim()) throw new GraphApiError("Follow-up DM text is empty", { status: 400 });
 
-      await sendDirectMessage(env, token, igUserId, recipient, text);
-
-      await env.DB.batch([
-        env.DB.prepare(
-          "UPDATE outbound_jobs SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
-        ).bind(now, job.id),
-        env.DB.prepare(
-          `UPDATE comment_executions
-           SET state = 'completed', opt_in_completed_at = COALESCE(opt_in_completed_at, ?),
-               last_error = NULL, updated_at = ?
-           WHERE comment_id = ?`,
-        ).bind(now, now, job.comment_id),
-      ]);
+      await sendDirectMessage(env, ig.token, ig.igUserId, recipient, text);
+      await markFollowupSent(env, job, now);
       return "sent";
     }
 
@@ -259,6 +323,7 @@ async function processJob(
     const retryable = error instanceof GraphApiError ? error.retryable : true;
 
     console.error("outbound job failed", {
+      platform,
       jobType: job.job_type,
       commentId: job.comment_id,
       attempts: job.attempts,
@@ -275,6 +340,69 @@ async function processJob(
     await failJob(env, job, now, message);
     return "failed";
   }
+}
+
+/** Marks the private reply job done and advances the execution state. */
+async function finishPrivateReply(
+  env: Env,
+  job: OutboundJobRow,
+  now: string,
+  optInRecipient: string | null,
+  deliveryMode: DeliveryMode,
+): Promise<void> {
+  if (deliveryMode === "two_step_opt_in") {
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE outbound_jobs SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
+      ).bind(now, job.id),
+      env.DB.prepare(
+        `UPDATE comment_executions
+         SET state = 'awaiting_opt_in', private_reply_sent_at = ?,
+             recipient_igsid = COALESCE(?, recipient_igsid),
+             last_error = NULL, updated_at = ?
+         WHERE comment_id = ?`,
+      ).bind(now, optInRecipient, now, job.comment_id),
+    ]);
+    return;
+  }
+
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE outbound_jobs SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
+    ).bind(now, job.id),
+    env.DB.prepare(
+      `UPDATE comment_executions
+       SET state = 'completed', private_reply_sent_at = ?, opt_in_completed_at = ?,
+           recipient_igsid = COALESCE(?, recipient_igsid),
+           last_error = NULL, updated_at = ?
+       WHERE comment_id = ?`,
+    ).bind(now, now, optInRecipient, now, job.comment_id),
+  ]);
+}
+
+async function markPublicReplySent(env: Env, job: OutboundJobRow, now: string): Promise<void> {
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE outbound_jobs SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
+    ).bind(now, job.id),
+    env.DB.prepare(
+      "UPDATE comment_executions SET public_reply_status = 'sent', updated_at = ? WHERE comment_id = ?",
+    ).bind(now, job.comment_id),
+  ]);
+}
+
+async function markFollowupSent(env: Env, job: OutboundJobRow, now: string): Promise<void> {
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE outbound_jobs SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
+    ).bind(now, job.id),
+    env.DB.prepare(
+      `UPDATE comment_executions
+       SET state = 'completed', opt_in_completed_at = COALESCE(opt_in_completed_at, ?),
+           last_error = NULL, updated_at = ?
+       WHERE comment_id = ?`,
+    ).bind(now, now, job.comment_id),
+  ]);
 }
 
 /**
@@ -297,14 +425,14 @@ export async function drainQueue(
     .bind(nowString, new Date(now.getTime() - STALE_PROCESSING_MS).toISOString())
     .run();
 
-  const token = await getToken(env);
-  if (!token) {
+  const context = await loadSendContext(env);
+  const platforms = configuredPlatforms(context);
+  if (platforms.length === 0) {
     stats.skipped = "no_token";
     return stats;
   }
 
-  const account = await getAccount(env);
-  const igUserId = account?.user_id ?? null;
+  const platformFilter = platforms.map(() => "?").join(", ");
 
   while (stats.claimed < maxJobs) {
     const limit = Math.min(CLAIM_BATCH, maxJobs - stats.claimed);
@@ -313,13 +441,13 @@ export async function drainQueue(
        SET status = 'processing', attempts = attempts + 1, updated_at = ?
        WHERE id IN (
          SELECT id FROM outbound_jobs
-         WHERE status = 'queued' AND run_after <= ?
+         WHERE status = 'queued' AND run_after <= ? AND platform IN (${platformFilter})
          ORDER BY run_after ASC
          LIMIT ?
        )
        RETURNING *`,
     )
-      .bind(nowString, nowString, limit)
+      .bind(nowString, nowString, ...platforms, limit)
       .all<OutboundJobRow>();
 
     const jobs = claimed.results ?? [];
@@ -327,7 +455,7 @@ export async function drainQueue(
 
     for (const job of jobs) {
       stats.claimed += 1;
-      const outcome = await processJob(env, token, igUserId, job, nowString);
+      const outcome = await processJob(env, context, job, nowString);
       if (outcome === "sent") stats.sent += 1;
       else if (outcome === "retried") stats.retried += 1;
       else stats.failed += 1;

@@ -197,6 +197,88 @@ export async function sendMessage(
   return response;
 }
 
+/* ------------------------------------------------------------------ */
+/* Facebook Page fixtures                                              */
+/* ------------------------------------------------------------------ */
+
+export function facebookCommentPayload(options: {
+  commentId?: string;
+  postId?: string;
+  text?: string;
+  fromId?: string;
+  name?: string;
+  parentId?: string;
+}): Record<string, unknown> {
+  const value: Record<string, unknown> = {
+    item: "comment",
+    verb: "add",
+    comment_id: options.commentId ?? "fb_comment_1",
+    post_id: options.postId ?? "page_1_111",
+    from: { id: options.fromId ?? "psid_1", name: options.name ?? "FB Fan" },
+    message: options.text ?? "send the link",
+    created_time: Math.floor(Date.now() / 1000),
+  };
+  if (options.parentId) value.parent_id = options.parentId;
+
+  return {
+    object: "page",
+    entry: [
+      {
+        id: "page_1",
+        time: Math.floor(Date.now() / 1000),
+        changes: [{ field: "feed", value }],
+      },
+    ],
+  };
+}
+
+export function facebookMessagePayload(options: {
+  senderId?: string;
+  text?: string;
+  mid?: string;
+}): Record<string, unknown> {
+  return {
+    object: "page",
+    entry: [
+      {
+        id: "page_1",
+        time: Math.floor(Date.now() / 1000),
+        messaging: [
+          {
+            sender: { id: options.senderId ?? "psid_1" },
+            recipient: { id: "page_1" },
+            timestamp: Date.now(),
+            message: {
+              mid: options.mid ?? `mid_fb_${Math.random().toString(36).slice(2)}`,
+              text: options.text ?? "YES",
+            },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+export async function sendFacebookComment(
+  ctx: TestContext,
+  options: Parameters<typeof facebookCommentPayload>[0] = {},
+): Promise<Response> {
+  const request = await signedWebhookRequest(APP_SECRET, facebookCommentPayload(options));
+  const response = await ctx.dispatch(request);
+  await ctx.settle();
+  return response;
+}
+
+export async function sendFacebookMessage(
+  ctx: TestContext,
+  options: Parameters<typeof facebookMessagePayload>[0] = {},
+): Promise<Response> {
+  const request = await signedWebhookRequest(APP_SECRET, facebookMessagePayload(options));
+  const response = await ctx.dispatch(request);
+  await ctx.settle();
+  return response;
+}
+
 export async function login(ctx: TestContext, ip = "203.0.113.10"): Promise<string> {
   const response = await ctx.dispatch(
     jsonRequest("/admin/login", { password: ADMIN_PASSWORD }, { "cf-connecting-ip": ip }),
@@ -232,6 +314,7 @@ export async function insertRule(ctx: TestContext, overrides: Partial<Rule> = {}
   const rule: Rule = {
     id: crypto.randomUUID(),
     name: "Test rule",
+    platform: "both",
     target_mode: "all_posts",
     media_ids: [],
     match_mode: "any_keyword",
@@ -250,14 +333,15 @@ export async function insertRule(ctx: TestContext, overrides: Partial<Rule> = {}
 
   await ctx.env.DB.prepare(
     `INSERT INTO rules
-       (id, name, target_mode, media_ids_json, match_mode, keywords_json, delivery_mode,
+       (id, name, platform, target_mode, media_ids_json, match_mode, keywords_json, delivery_mode,
         initial_dm_text, opt_in_keywords_json, followup_dm_text, public_replies_json,
         priority, enabled, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       rule.id,
       rule.name,
+      rule.platform,
       rule.target_mode,
       JSON.stringify(rule.media_ids),
       rule.match_mode,
@@ -403,6 +487,26 @@ export function installMetaMock(
     }
     if (call.path.endsWith("/replies")) {
       return jsonResponse({ id: `reply_${calls.length}` });
+    }
+    if (call.path.endsWith("/comments")) {
+      return jsonResponse({ id: `fb_comment_reply_${calls.length}` });
+    }
+    if (call.path.endsWith("/posts")) {
+      return jsonResponse({
+        data: [
+          {
+            id: "page_1_111",
+            message: "Crossposted reel",
+            created_time: "2026-11-01T10:00:00+0000",
+            permalink_url: "https://facebook.com/page_1/posts/111",
+            full_picture: "https://cdn.example.com/fb-one.jpg",
+            attachments: { data: [{ media_type: "video" }] },
+          },
+        ],
+      });
+    }
+    if (call.path.endsWith("/subscribed_apps")) {
+      return jsonResponse({ success: true });
     }
     if (call.path.endsWith("/me")) {
       return jsonResponse({ user_id: ACCOUNT_ID, username: "testaccount" });

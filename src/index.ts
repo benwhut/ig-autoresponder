@@ -19,12 +19,21 @@ import { findMatchingKeyword, pickRule } from "./matcher";
 import {
   GraphApiError,
   cacheMedia,
+  connectPage,
   connectToken,
+  deletePage,
+  fetchPagePosts,
   fetchRecentMedia,
   getAccount,
+  getPage,
+  getPageToken,
   getToken,
   getTokenStatus,
+  hasPageToken,
   refreshToken,
+  savePage,
+  savePageToken,
+  subscribePageWebhooks,
   timingSafeEqualString,
   verifyWebhookSignature,
 } from "./meta";
@@ -32,6 +41,7 @@ import { drainQueue, enqueueJob, retryFailedJobsForComment } from "./queue";
 import {
   EXECUTION_STATES,
   ruleInputSchema,
+  toPlatform,
   toRule,
   tokenInputSchema,
   truncate,
@@ -41,6 +51,7 @@ import type {
   Env,
   ExecutionState,
   MediaRow,
+  Platform,
   RuleRow,
   WebhookEventRow,
 } from "./types";
@@ -330,8 +341,8 @@ function collectMessageEvents(raw: unknown): Record<string, unknown>[] {
 async function processWebhook(env: Env, payload: Record<string, unknown>): Promise<void> {
   const object = asString(payload.object);
 
-  // Instagram Login sends object "instagram"; Page-linked Instagram messaging
-  // can arrive as object "page". Accept both.
+  // Instagram Login sends object "instagram"; Facebook Pages send "page".
+  // Page-linked Instagram messaging also arrives as "page".
   if (object !== "instagram" && object !== "page") {
     console.log("webhook ignored object", object);
     await recordWebhookEvent(env, {
@@ -352,7 +363,23 @@ async function processWebhook(env: Env, payload: Record<string, unknown>): Promi
   for (const rawEntry of entries) {
     const entry = asObject(rawEntry);
     const entryId = asString(entry.id) || null;
-    const ownerId = configuredOwner ?? entryId;
+
+    // Instagram comments are owned by the IG account; Facebook comments by the
+    // Page itself (`entry.id` is the Page id).
+    const ownerId = object === "page" ? entryId : (configuredOwner ?? entryId);
+
+    if (
+      object === "page" &&
+      entryId &&
+      account?.token_type === "facebook_graph" &&
+      entryId !== account.user_id
+    ) {
+      const existingPage = await getPage(env);
+      if (!existingPage) {
+        await savePage(env, { page_id: entryId, name: "", connected_at: new Date().toISOString() });
+        console.log("facebook page auto-provisioned from webhook", { pageId: entryId });
+      }
+    }
 
     const messaging = Array.isArray(entry.messaging) ? entry.messaging : [];
     const changes = Array.isArray(entry.changes) ? entry.changes : [];
@@ -367,16 +394,35 @@ async function processWebhook(env: Env, payload: Record<string, unknown>): Promi
 
     // Shape 1: entry[].messaging[]
     for (const rawEvent of messaging) {
-      await handleMessage(env, asObject(rawEvent), ownerId, { entryId, source: "messaging" });
+      await handleMessage(env, asObject(rawEvent), ownerId, { entryId, source: "messaging", object });
     }
 
-    // Shape 2: entry[].changes[] with field "comments" or "messages"
+    // Shape 2: entry[].changes[] with a field we handle.
     for (const rawChange of changes) {
       const change = asObject(rawChange);
       const field = asString(change.field);
+      const value = asObject(change.value);
 
       if (field === "comments") {
-        await handleComment(env, asObject(change.value), ownerId);
+        const comment =
+          object === "page"
+            ? normalizeFacebookComment(value)
+            : normalizeInstagramComment(value);
+        if (comment) await handleComment(env, comment, ownerId);
+        continue;
+      }
+
+      if (field === "feed") {
+        const comment = normalizeFacebookComment(value);
+        if (comment) {
+          await handleComment(env, comment, ownerId);
+        } else {
+          console.log("webhook feed change ignored", {
+            entryId,
+            item: asString(value.item),
+            verb: asString(value.verb),
+          });
+        }
         continue;
       }
 
@@ -394,7 +440,7 @@ async function processWebhook(env: Env, payload: Record<string, unknown>): Promi
           continue;
         }
         for (const event of events) {
-          await handleMessage(env, event, ownerId, { entryId, source: "changes" });
+          await handleMessage(env, event, ownerId, { entryId, source: "changes", object });
         }
         continue;
       }
@@ -420,10 +466,12 @@ async function recordIgnored(
     username: string | null;
     text: string;
     reason: string;
+    platform: Platform;
   },
 ): Promise<void> {
   const now = new Date().toISOString();
   console.log("inbound comment ignored", {
+    platform: input.platform,
     commentId: input.commentId,
     mediaId: input.mediaId,
     commenterIgsid: input.commenterIgsid,
@@ -431,9 +479,9 @@ async function recordIgnored(
   });
   await env.DB.prepare(
     `INSERT INTO comment_executions
-       (comment_id, media_id, commenter_igsid, commenter_username, comment_text, rule_id, state,
-        private_reply_sent_at, opt_in_completed_at, public_reply_status, last_error, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, NULL, 'ignored', NULL, NULL, 'none', ?, ?, ?)
+       (comment_id, media_id, commenter_igsid, commenter_username, comment_text, rule_id, platform,
+        state, private_reply_sent_at, opt_in_completed_at, public_reply_status, last_error, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, NULL, ?, 'ignored', NULL, NULL, 'none', ?, ?, ?)
      ON CONFLICT(comment_id) DO NOTHING`,
   )
     .bind(
@@ -442,6 +490,7 @@ async function recordIgnored(
       input.commenterIgsid,
       input.username,
       input.text,
+      input.platform,
       input.reason,
       now,
       now,
@@ -449,42 +498,89 @@ async function recordIgnored(
     .run();
 }
 
-async function handleComment(
-  env: Env,
-  value: Record<string, unknown>,
-  ownerId: string | null,
-): Promise<void> {
+interface NormalizedComment {
+  commentId: string;
+  mediaId: string;
+  commenterId: string;
+  username: string | null;
+  text: string;
+  parentId: string | null;
+  platform: Platform;
+}
+
+/** Instagram comment: `changes[].value` with `field: "comments"`. */
+function normalizeInstagramComment(value: Record<string, unknown>): NormalizedComment | null {
   const commentId = asString(value.id);
-  if (!commentId) return;
+  if (!commentId) return null;
+  const from = asObject(value.from);
+  return {
+    commentId,
+    mediaId: asString(asObject(value.media).id),
+    commenterId: asString(from.id),
+    username: asString(from.username) || null,
+    text: typeof value.text === "string" ? value.text : "",
+    parentId: asString(value.parent_id) || null,
+    platform: "instagram",
+  };
+}
+
+/** Facebook Page comment: `changes[].value` with `field: "feed"`. */
+function normalizeFacebookComment(value: Record<string, unknown>): NormalizedComment | null {
+  const item = asString(value.item);
+  if (item && item !== "comment") return null;
+  const verb = asString(value.verb);
+  if (verb && verb !== "add") return null;
+
+  const commentId = asString(value.comment_id) || asString(value.id);
+  if (!commentId) return null;
 
   const from = asObject(value.from);
-  const commenterIgsid = asString(from.id);
-  const username = asString(from.username) || null;
-  const text = typeof value.text === "string" ? value.text : "";
-  const mediaId = asString(asObject(value.media).id);
-  const parentId = asString(value.parent_id);
+  return {
+    commentId,
+    mediaId: asString(value.post_id) || asString(asObject(value.media).id),
+    commenterId: asString(from.id),
+    username: asString(from.name) || asString(from.username) || null,
+    text:
+      typeof value.message === "string"
+        ? value.message
+        : typeof value.text === "string"
+          ? value.text
+          : "",
+    parentId: asString(value.parent_id) || null,
+    platform: "facebook",
+  };
+}
+
+async function handleComment(
+  env: Env,
+  comment: NormalizedComment,
+  ownerId: string | null,
+): Promise<void> {
+  const { commentId, mediaId, commenterId, username, text, parentId, platform } = comment;
 
   console.log("inbound comment", {
+    platform,
     commentId,
     mediaId,
-    commenterIgsid,
+    commenterIgsid: commenterId,
     username,
     parentId: parentId || null,
     text,
   });
 
   // Ignore the account's own comments (echo / loop prevention).
-  if (!commenterIgsid || (ownerId !== null && commenterIgsid === ownerId)) return;
+  if (!commenterId || (ownerId !== null && commenterId === ownerId)) return;
 
   // Only top-level comments trigger automations.
   if (parentId) {
     await recordIgnored(env, {
       commentId,
       mediaId,
-      commenterIgsid,
+      commenterIgsid: commenterId,
       username,
       text,
       reason: "reply_to_comment",
+      platform,
     });
     return;
   }
@@ -499,21 +595,23 @@ async function handleComment(
 
   const ruleRows = await env.DB.prepare("SELECT * FROM rules WHERE enabled = 1").all<RuleRow>();
   const rules = (ruleRows.results ?? []).map(toRule);
-  const rule = pickRule(rules, mediaId, text);
+  const rule = pickRule(rules, mediaId, text, platform);
 
   if (!rule) {
     await recordIgnored(env, {
       commentId,
       mediaId,
-      commenterIgsid,
+      commenterIgsid: commenterId,
       username,
       text,
       reason: "no_matching_rule",
+      platform,
     });
     return;
   }
 
   console.log("inbound comment matched", {
+    platform,
     commentId,
     mediaId,
     ruleId: rule.id,
@@ -531,30 +629,32 @@ async function handleComment(
   const statements = [
     env.DB.prepare(
       `INSERT INTO comment_executions
-         (comment_id, media_id, commenter_igsid, commenter_username, comment_text, rule_id, state,
-          private_reply_sent_at, opt_in_completed_at, public_reply_status, last_error, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'matched_queued', NULL, NULL, ?, NULL, ?, ?)
+         (comment_id, media_id, commenter_igsid, commenter_username, comment_text, rule_id, platform,
+          state, private_reply_sent_at, opt_in_completed_at, public_reply_status, last_error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'matched_queued', NULL, NULL, ?, NULL, ?, ?)
        ON CONFLICT(comment_id) DO NOTHING`,
     ).bind(
       commentId,
       mediaId,
-      commenterIgsid,
+      commenterId,
       username,
       text,
       rule.id,
+      platform,
       chosenPublicReply ? "queued" : "none",
       nowString,
       nowString,
     ),
     env.DB.prepare(
       `INSERT INTO outbound_jobs
-         (id, job_type, comment_id, recipient_igsid, payload_json, status, attempts, max_attempts,
+         (id, job_type, comment_id, recipient_igsid, platform, payload_json, status, attempts, max_attempts,
           run_after, last_error, created_at, updated_at)
-       VALUES (?, 'private_reply', ?, NULL, ?, 'queued', 0, 5, ?, NULL, ?, ?)
+       VALUES (?, 'private_reply', ?, NULL, ?, ?, 'queued', 0, 5, ?, NULL, ?, ?)
        ON CONFLICT(comment_id, job_type) DO NOTHING`,
     ).bind(
       crypto.randomUUID(),
       commentId,
+      platform,
       JSON.stringify({
         text: rule.initial_dm_text,
         delivery_mode: rule.delivery_mode,
@@ -571,13 +671,14 @@ async function handleComment(
     statements.push(
       env.DB.prepare(
         `INSERT INTO outbound_jobs
-           (id, job_type, comment_id, recipient_igsid, payload_json, status, attempts, max_attempts,
+           (id, job_type, comment_id, recipient_igsid, platform, payload_json, status, attempts, max_attempts,
             run_after, last_error, created_at, updated_at)
-         VALUES (?, 'public_reply', ?, NULL, ?, 'queued', 0, 5, ?, NULL, ?, ?)
+         VALUES (?, 'public_reply', ?, NULL, ?, ?, 'queued', 0, 5, ?, NULL, ?, ?)
          ON CONFLICT(comment_id, job_type) DO NOTHING`,
       ).bind(
         crypto.randomUUID(),
         commentId,
+        platform,
         JSON.stringify({ text: chosenPublicReply }),
         publicRunAfter,
         nowString,
@@ -592,6 +693,7 @@ async function handleComment(
 interface MessageContext {
   entryId: string | null;
   source: "messaging" | "changes";
+  object: string;
 }
 
 async function handleMessage(
@@ -618,7 +720,7 @@ async function handleMessage(
       entryId: context.entryId,
     });
     await recordWebhookEvent(env, {
-      object: "instagram",
+      object: context.object,
       entryId: context.entryId,
       kind: "dm",
       senderId,
@@ -714,16 +816,20 @@ async function handleMessage(
     return;
   }
 
-  // Step 2: POST /{ig_user_id}/messages with recipient.id = senderId.
+  // Step 2: send the follow-up on the platform that owns the matched session.
+  // Instagram: POST /{ig_user_id}/messages; Facebook: POST /{page_id}/messages.
+  const platform = toPlatform(row.platform);
   const enqueued = await enqueueJob(env, {
     jobType: "followup_dm",
     commentId: row.comment_id,
     recipientIgsid: senderId,
     payload: { text: followupText },
     runAfter: new Date(),
+    platform,
   });
 
   console.log("followup dm enqueued", {
+    platform,
     commentId: row.comment_id,
     senderId,
     enqueued,
@@ -813,9 +919,11 @@ app.post("/admin/logout", (c) => {
 /* ------------------------------------------------------------------ */
 
 app.get("/admin/api/state", async (c) => {
-  const [account, token, statsRows, queueRows] = await Promise.all([
+  const [account, token, page, pageTokenSet, statsRows, queueRows] = await Promise.all([
     getAccount(c.env),
     getTokenStatus(c.env),
+    getPage(c.env),
+    hasPageToken(c.env),
     c.env.DB.prepare(
       "SELECT state, COUNT(*) AS n FROM comment_executions GROUP BY state",
     ).all<{ state: string; n: number }>(),
@@ -829,7 +937,14 @@ app.get("/admin/api/state", async (c) => {
   const queue: Record<string, number> = {};
   for (const row of queueRows.results ?? []) queue[row.status] = Number(row.n);
 
-  return c.json({ account, token, stats, queue });
+  return c.json({
+    account,
+    token,
+    page,
+    page_token: pageTokenSet ? "configured" : null,
+    stats,
+    queue,
+  });
 });
 
 app.post("/admin/api/token", async (c) => {
@@ -871,14 +986,15 @@ app.post("/admin/api/rules", async (c) => {
 
   await c.env.DB.prepare(
     `INSERT INTO rules
-       (id, name, target_mode, media_ids_json, match_mode, keywords_json, delivery_mode,
+       (id, name, platform, target_mode, media_ids_json, match_mode, keywords_json, delivery_mode,
         initial_dm_text, opt_in_keywords_json, followup_dm_text, public_replies_json,
         priority, enabled, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       id,
       body.name,
+      body.platform,
       body.target_mode,
       JSON.stringify(body.media_ids),
       body.match_mode,
@@ -913,13 +1029,14 @@ app.put("/admin/api/rules/:id", async (c) => {
   const now = new Date().toISOString();
   const result = await c.env.DB.prepare(
     `UPDATE rules SET
-       name = ?, target_mode = ?, media_ids_json = ?, match_mode = ?, keywords_json = ?,
+       name = ?, platform = ?, target_mode = ?, media_ids_json = ?, match_mode = ?, keywords_json = ?,
        delivery_mode = ?, initial_dm_text = ?, opt_in_keywords_json = ?, followup_dm_text = ?,
        public_replies_json = ?, priority = ?, enabled = ?, updated_at = ?
      WHERE id = ?`,
   )
     .bind(
       body.name,
+      body.platform,
       body.target_mode,
       JSON.stringify(body.media_ids),
       body.match_mode,
@@ -977,17 +1094,78 @@ app.post("/admin/api/media/sync", async (c) => {
     if (!token) return c.json({ error: "No Instagram token configured" }, 400);
 
     const account = await getAccount(c.env);
-    const items = await fetchRecentMedia(c.env, token, account?.user_id ?? null, 25);
-    await cacheMedia(c.env, items);
+    const instagramItems = await fetchRecentMedia(c.env, token, account?.user_id ?? null, 25);
+    await cacheMedia(c.env, instagramItems);
+
+    let facebookItems: MediaRow[] = [];
+    const page = await getPage(c.env);
+    const pageToken = await getPageToken(c.env);
+    if (page && pageToken) {
+      try {
+        facebookItems = await fetchPagePosts(c.env, pageToken, page.page_id, 25);
+        await cacheMedia(c.env, facebookItems);
+      } catch (error) {
+        console.warn("facebook page sync failed", error);
+      }
+    }
 
     const rows = await c.env.DB.prepare(
       "SELECT * FROM media_cache ORDER BY timestamp DESC LIMIT 100",
     ).all<MediaRow>();
 
-    return c.json({ synced: items.length, media: rows.results ?? [] });
+    return c.json({
+      synced: instagramItems.length + facebookItems.length,
+      instagram: instagramItems.length,
+      facebook: facebookItems.length,
+      media: rows.results ?? [],
+    });
   } catch (error) {
     return adminError(c, error);
   }
+});
+
+app.get("/admin/api/page", async (c) => {
+  const [page, pageTokenSet] = await Promise.all([getPage(c.env), hasPageToken(c.env)]);
+  return c.json({ page, has_token: pageTokenSet });
+});
+
+app.post("/admin/api/page/connect", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const pageId = typeof body.page_id === "string" ? body.page_id.trim() : undefined;
+    const page = await connectPage(c.env, { pageId: pageId || undefined });
+    return c.json({ page });
+  } catch (error) {
+    return adminError(c, error);
+  }
+});
+
+app.post("/admin/api/page/token", async (c) => {
+  try {
+    const body = tokenInputSchema.parse(await c.req.json());
+    await savePageToken(c.env, body.token);
+    const page = await connectPage(c.env, { token: body.token });
+    return c.json({ page });
+  } catch (error) {
+    return adminError(c, error);
+  }
+});
+
+app.post("/admin/api/page/subscribe", async (c) => {
+  try {
+    const page = await getPage(c.env);
+    const token = await getPageToken(c.env);
+    if (!page || !token) return c.json({ error: "Connect a Facebook Page first" }, 400);
+    await subscribePageWebhooks(c.env, token, page.page_id);
+    return c.json({ subscribed: true, page_id: page.page_id });
+  } catch (error) {
+    return adminError(c, error);
+  }
+});
+
+app.delete("/admin/api/page", async (c) => {
+  await deletePage(c.env);
+  return c.json({ ok: true });
 });
 
 app.get("/admin/api/media", async (c) => {

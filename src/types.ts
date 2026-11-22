@@ -18,9 +18,17 @@ export interface Env {
 /* Domain unions                                                       */
 /* ------------------------------------------------------------------ */
 
+/** Where a comment came from and which API sends the reply. */
+export type Platform = "instagram" | "facebook";
+
+/** A rule can serve one platform or both. */
+export type RulePlatform = Platform | "both";
+
 export type TargetMode = "all_posts" | "specific_posts";
 export type MatchMode = "any_keyword" | "any_comment";
 export type DeliveryMode = "two_step_opt_in" | "direct_link";
+
+export const PLATFORMS: readonly Platform[] = ["instagram", "facebook"];
 
 export type ExecutionState =
   | "matched_queued"
@@ -68,6 +76,13 @@ export interface AccountInfo {
   connected_at?: string;
 }
 
+/** A Facebook Page used for comments and Messenger replies. */
+export interface PageAccountInfo {
+  page_id: string;
+  name: string;
+  connected_at?: string;
+}
+
 export interface MediaRow {
   media_id: string;
   media_type: "IMAGE" | "VIDEO" | "CAROUSEL_ALBUM" | "REELS";
@@ -76,11 +91,14 @@ export interface MediaRow {
   thumbnail_url: string | null;
   timestamp: string;
   synced_at: string;
+  /** Instagram media or a Facebook Page post. */
+  platform: Platform;
 }
 
 export interface RuleRow {
   id: string;
   name: string;
+  platform: string;
   target_mode: string;
   media_ids_json: string;
   match_mode: string;
@@ -100,6 +118,7 @@ export interface RuleRow {
 export interface Rule {
   id: string;
   name: string;
+  platform: RulePlatform;
   target_mode: TargetMode;
   media_ids: string[];
   match_mode: MatchMode;
@@ -119,11 +138,13 @@ export interface CommentExecutionRow {
   comment_id: string;
   media_id: string;
   commenter_igsid: string;
-  /** Instagram-scoped id returned by Meta as `recipient_id` for the private reply. */
+  /** Instagram-scoped id (IGSID) or Facebook Page-scoped id (PSID). */
   recipient_igsid: string | null;
   commenter_username: string | null;
   comment_text: string;
   rule_id: string | null;
+  /** Selects the Instagram Graph or Messenger send path. */
+  platform: Platform;
   state: ExecutionState;
   private_reply_sent_at: string | null;
   opt_in_completed_at: string | null;
@@ -138,6 +159,8 @@ export interface OutboundJobRow {
   job_type: JobType;
   comment_id: string;
   recipient_igsid: string | null;
+  /** Which send API the job must use. */
+  platform: Platform;
   payload_json: string;
   status: JobStatus;
   attempts: number;
@@ -190,6 +213,7 @@ const mediaId = z.string().trim().min(1).max(64);
 export const ruleInputSchema = z
   .object({
     name: z.string().trim().min(1, "Name is required").max(80),
+    platform: z.enum(["instagram", "facebook", "both"]).default("both"),
     target_mode: z.enum(["all_posts", "specific_posts"]).default("all_posts"),
     media_ids: z.array(mediaId).max(50).default([]),
     match_mode: z.enum(["any_keyword", "any_comment"]).default("any_keyword"),
@@ -269,10 +293,20 @@ export function parseJsonArray<T>(raw: string | null | undefined, fallback: T[] 
   }
 }
 
+export function toRulePlatform(value: string | null | undefined): RulePlatform {
+  if (value === "instagram" || value === "facebook") return value;
+  return "both";
+}
+
+export function toPlatform(value: string | null | undefined): Platform {
+  return value === "facebook" ? "facebook" : "instagram";
+}
+
 export function toRule(row: RuleRow): Rule {
   return {
     id: row.id,
     name: row.name,
+    platform: toRulePlatform(row.platform),
     target_mode: row.target_mode === "all_posts" ? "all_posts" : "specific_posts",
     media_ids: parseJsonArray<string>(row.media_ids_json).filter((v) => typeof v === "string"),
     match_mode: row.match_mode === "any_comment" ? "any_comment" : "any_keyword",
