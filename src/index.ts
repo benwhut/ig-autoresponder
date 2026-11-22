@@ -34,6 +34,7 @@ import {
   ruleInputSchema,
   toRule,
   tokenInputSchema,
+  truncate,
 } from "./types";
 import type {
   CommentExecutionRow,
@@ -41,6 +42,7 @@ import type {
   ExecutionState,
   MediaRow,
   RuleRow,
+  WebhookEventRow,
 } from "./types";
 
 type AppEnv = { Bindings: Env };
@@ -188,6 +190,10 @@ app.post("/webhook", async (c) => {
   const signature = c.req.header("x-hub-signature-256") ?? null;
 
   if (!(await verifyWebhookSignature(rawBody, signature, c.env.IG_APP_SECRET ?? ""))) {
+    console.error("webhook signature verification failed", {
+      signaturePresent: Boolean(signature),
+      bodyLength: rawBody.length,
+    });
     return c.text("Invalid signature", 401);
   }
 
@@ -195,8 +201,12 @@ app.post("/webhook", async (c) => {
   try {
     payload = JSON.parse(rawBody);
   } catch {
+    console.error("webhook payload was not valid JSON", { bodyLength: rawBody.length });
     return c.text("Invalid JSON", 400);
   }
+
+  // Full payload so `wrangler tail` shows the exact shape Meta sends.
+  console.log("webhook received", JSON.stringify(payload));
 
   try {
     await processWebhook(c.env, asObject(payload));
@@ -217,28 +227,186 @@ app.post("/webhook", async (c) => {
   return c.text("EVENT_RECEIVED", 200);
 });
 
+/** Persists one diagnostic webhook event. Never throws. */
+async function recordWebhookEvent(
+  env: Env,
+  input: {
+    object?: string | null;
+    entryId?: string | null;
+    kind: string;
+    senderId?: string | null;
+    recipientId?: string | null;
+    text?: string | null;
+    reason?: string | null;
+    payload?: unknown;
+  },
+): Promise<void> {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO webhook_events
+         (id, object, entry_id, kind, sender_id, recipient_id, text, reason, payload_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        crypto.randomUUID(),
+        input.object ?? null,
+        input.entryId ?? null,
+        input.kind,
+        input.senderId ?? null,
+        input.recipientId ?? null,
+        input.text ? truncate(input.text, 1000) : null,
+        input.reason ? truncate(input.reason, 500) : null,
+        input.payload === undefined ? null : truncate(JSON.stringify(input.payload), 8000),
+        new Date().toISOString(),
+      )
+      .run();
+  } catch (error) {
+    console.error("Could not record webhook event", error);
+  }
+}
+
+/**
+ * Normalises the Instagram DM shapes into one event object:
+ *   { sender, recipient, message: { mid, text, is_echo } }   (entry[].messaging[])
+ *   { value: { sender, recipient, message } }                (entry[].changes[])
+ *   { sender_id, recipient_id, message: "YES" }              (flat variants)
+ *   { sender_id, recipient_id, text: "YES" }
+ */
+function normalizeMessageEvent(raw: unknown): Record<string, unknown> | null {
+  const value = asObject(raw);
+  const nested = asObject(value.value);
+  const candidate = nested.sender || nested.message ? nested : value;
+
+  const senderId = asString(asObject(candidate.sender).id) || asString(candidate.sender_id);
+  const recipientId =
+    asString(asObject(candidate.recipient).id) || asString(candidate.recipient_id);
+
+  if (!senderId) return null;
+
+  const messageValue = candidate.message;
+
+  if (messageValue && typeof messageValue === "object" && !Array.isArray(messageValue)) {
+    const message = asObject(messageValue);
+    const text =
+      typeof message.text === "string"
+        ? message.text
+        : typeof candidate.text === "string"
+          ? candidate.text
+          : "";
+    return {
+      sender: { id: senderId },
+      recipient: { id: recipientId },
+      message: { ...message, text },
+    };
+  }
+
+  const text =
+    typeof messageValue === "string"
+      ? messageValue
+      : typeof candidate.text === "string"
+        ? candidate.text
+        : "";
+
+  return {
+    sender: { id: senderId },
+    recipient: { id: recipientId },
+    message: { mid: asString(candidate.mid), text },
+  };
+}
+
+/** Collects every DM event from a `changes[].value` payload. */
+function collectMessageEvents(raw: unknown): Record<string, unknown>[] {
+  if (Array.isArray(raw)) return raw.flatMap((item) => collectMessageEvents(item));
+
+  const value = asObject(raw);
+  if (Array.isArray(value.messaging)) {
+    return value.messaging.flatMap((item) => collectMessageEvents(item));
+  }
+
+  const normalized = normalizeMessageEvent(value);
+  return normalized ? [normalized] : [];
+}
+
 async function processWebhook(env: Env, payload: Record<string, unknown>): Promise<void> {
-  if (payload.object !== "instagram") return;
+  const object = asString(payload.object);
+
+  // Instagram Login sends object "instagram"; Page-linked Instagram messaging
+  // can arrive as object "page". Accept both.
+  if (object !== "instagram" && object !== "page") {
+    console.log("webhook ignored object", object);
+    await recordWebhookEvent(env, {
+      object,
+      kind: "ignored_object",
+      reason: `object=${object || "(missing)"}`,
+      payload,
+    });
+    return;
+  }
 
   const account = await getAccount(env);
   const configuredOwner = account?.user_id ?? null;
   const entries = Array.isArray(payload.entry) ? payload.entry : [];
 
+  await recordWebhookEvent(env, { object, kind: "received", payload });
+
   for (const rawEntry of entries) {
     const entry = asObject(rawEntry);
-    const ownerId = configuredOwner ?? (asString(entry.id) || null);
-
-    const changes = Array.isArray(entry.changes) ? entry.changes : [];
-    for (const rawChange of changes) {
-      const change = asObject(rawChange);
-      if (change.field === "comments") {
-        await handleComment(env, asObject(change.value), ownerId);
-      }
-    }
+    const entryId = asString(entry.id) || null;
+    const ownerId = configuredOwner ?? entryId;
 
     const messaging = Array.isArray(entry.messaging) ? entry.messaging : [];
+    const changes = Array.isArray(entry.changes) ? entry.changes : [];
+    const changeFields = changes.map((change) => asString(asObject(change).field)).filter(Boolean);
+
+    console.log("webhook entry", {
+      object,
+      entryId,
+      messaging: messaging.length,
+      changes: changeFields,
+    });
+
+    // Shape 1: entry[].messaging[]
     for (const rawEvent of messaging) {
-      await handleMessage(env, asObject(rawEvent), ownerId);
+      await handleMessage(env, asObject(rawEvent), ownerId, { entryId, source: "messaging" });
+    }
+
+    // Shape 2: entry[].changes[] with field "comments" or "messages"
+    for (const rawChange of changes) {
+      const change = asObject(rawChange);
+      const field = asString(change.field);
+
+      if (field === "comments") {
+        await handleComment(env, asObject(change.value), ownerId);
+        continue;
+      }
+
+      if (field === "messages") {
+        const events = collectMessageEvents(change.value);
+        if (events.length === 0) {
+          console.log("webhook messages change had no message event", { entryId, value: change.value });
+          await recordWebhookEvent(env, {
+            object,
+            entryId,
+            kind: "dm",
+            reason: "unrecognized_messages_shape",
+            payload: change,
+          });
+          continue;
+        }
+        for (const event of events) {
+          await handleMessage(env, event, ownerId, { entryId, source: "changes" });
+        }
+        continue;
+      }
+
+      console.log("webhook change ignored", { entryId, field });
+      await recordWebhookEvent(env, {
+        object,
+        entryId,
+        kind: "change_ignored",
+        reason: field || "missing_field",
+        payload: change,
+      });
     }
   }
 }
@@ -255,6 +423,12 @@ async function recordIgnored(
   },
 ): Promise<void> {
   const now = new Date().toISOString();
+  console.log("inbound comment ignored", {
+    commentId: input.commentId,
+    mediaId: input.mediaId,
+    commenterIgsid: input.commenterIgsid,
+    reason: input.reason,
+  });
   await env.DB.prepare(
     `INSERT INTO comment_executions
        (comment_id, media_id, commenter_igsid, commenter_username, comment_text, rule_id, state,
@@ -289,6 +463,15 @@ async function handleComment(
   const text = typeof value.text === "string" ? value.text : "";
   const mediaId = asString(asObject(value.media).id);
   const parentId = asString(value.parent_id);
+
+  console.log("inbound comment", {
+    commentId,
+    mediaId,
+    commenterIgsid,
+    username,
+    parentId: parentId || null,
+    text,
+  });
 
   // Ignore the account's own comments (echo / loop prevention).
   if (!commenterIgsid || (ownerId !== null && commenterIgsid === ownerId)) return;
@@ -329,6 +512,13 @@ async function handleComment(
     });
     return;
   }
+
+  console.log("inbound comment matched", {
+    commentId,
+    mediaId,
+    ruleId: rule.id,
+    deliveryMode: rule.delivery_mode,
+  });
 
   const now = new Date();
   const nowString = now.toISOString();
@@ -399,49 +589,60 @@ async function handleComment(
   await env.DB.batch(statements);
 }
 
+interface MessageContext {
+  entryId: string | null;
+  source: "messaging" | "changes";
+}
+
 async function handleMessage(
   env: Env,
   event: Record<string, unknown>,
   ownerId: string | null,
+  context: MessageContext,
 ): Promise<void> {
   const message = asObject(event.message);
   const sender = asObject(event.sender);
   const senderId = asString(sender.id);
   const recipientId = asString(asObject(event.recipient).id);
   const text = typeof message.text === "string" ? message.text : "";
+  const isEcho = message.is_echo === true || message.is_echo === "true";
 
-  // Only echoes and non-text events are ignored outright.
-  if (message.is_echo === true) {
+  const logInbound = async (reason: string, matchedSessionId: string | null): Promise<void> => {
     console.log("inbound dm", {
       senderId,
       recipientId,
       text,
-      matchedSessionId: null,
-      reason: "echo",
+      matchedSessionId,
+      reason,
+      source: context.source,
+      entryId: context.entryId,
     });
+    await recordWebhookEvent(env, {
+      object: "instagram",
+      entryId: context.entryId,
+      kind: "dm",
+      senderId,
+      recipientId,
+      text,
+      reason: matchedSessionId ? `${reason}:${matchedSessionId}` : reason,
+      payload: event,
+    });
+  };
+
+  // Only echoes and non-text events are ignored outright.
+  if (isEcho) {
+    await logInbound("echo", null);
     return;
   }
 
   if (!text.trim()) {
-    console.log("inbound dm", {
-      senderId,
-      recipientId,
-      text,
-      matchedSessionId: null,
-      reason: "no_text",
-    });
+    await logInbound("no_text", null);
     return;
   }
 
   // Ignore messages sent by the account itself (loop prevention).
   if (!senderId || (ownerId !== null && senderId === ownerId)) {
-    console.log("inbound dm", {
-      senderId,
-      recipientId,
-      text,
-      matchedSessionId: null,
-      reason: senderId ? "self" : "no_sender",
-    });
+    await logInbound(senderId ? "self" : "no_sender", null);
     return;
   }
 
@@ -471,35 +672,17 @@ async function handleMessage(
     >();
 
   if (!row) {
-    console.log("inbound dm", {
-      senderId,
-      recipientId,
-      text,
-      matchedSessionId: null,
-      reason: "no_pending_opt_in",
-    });
+    await logInbound("no_pending_opt_in", null);
     return;
   }
 
   const optInKeywords = parseStringArray(row.rule_opt_in_keywords_json);
   if (optInKeywords.length > 0 && !findMatchingKeyword(text, optInKeywords)) {
-    console.log("inbound dm", {
-      senderId,
-      recipientId,
-      text,
-      matchedSessionId: row.comment_id,
-      reason: "keyword_mismatch",
-    });
+    await logInbound("keyword_mismatch", row.comment_id);
     return;
   }
 
-  console.log("inbound dm", {
-    senderId,
-    recipientId,
-    text,
-    matchedSessionId: row.comment_id,
-    reason: "matched",
-  });
+  await logInbound("matched", row.comment_id);
 
   const now = new Date().toISOString();
   const followupText = (row.rule_followup_dm_text ?? "").trim();
@@ -512,6 +695,7 @@ async function handleMessage(
     )
       .bind("Rule was deleted or has no follow-up message", now, row.comment_id)
       .run();
+    await logInbound("no_followup_text", row.comment_id);
     return;
   }
 
@@ -525,15 +709,25 @@ async function handleMessage(
     .bind(now, senderId, now, row.comment_id)
     .run();
 
-  if ((updated.meta.changes ?? 0) !== 1) return;
+  if ((updated.meta.changes ?? 0) !== 1) {
+    await logInbound("already_completed", row.comment_id);
+    return;
+  }
 
   // Step 2: POST /{ig_user_id}/messages with recipient.id = senderId.
-  await enqueueJob(env, {
+  const enqueued = await enqueueJob(env, {
     jobType: "followup_dm",
     commentId: row.comment_id,
     recipientIgsid: senderId,
     payload: { text: followupText },
     runAfter: new Date(),
+  });
+
+  console.log("followup dm enqueued", {
+    commentId: row.comment_id,
+    senderId,
+    enqueued,
+    source: context.source,
   });
 }
 
@@ -848,7 +1042,19 @@ app.get("/admin/api/logs", async (c) => {
     .bind(...params)
     .all<CommentExecutionRow & { rule_name: string | null; job_status: string | null; job_id: string | null }>();
 
-  return c.json({ logs: rows.results ?? [] });
+  // Raw webhook diagnostics: shows the exact payload shape Meta sends and why
+  // each inbound DM branch matched or was skipped.
+  let events: WebhookEventRow[] = [];
+  try {
+    const eventRows = await c.env.DB.prepare(
+      "SELECT * FROM webhook_events ORDER BY created_at DESC LIMIT 50",
+    ).all<WebhookEventRow>();
+    events = eventRows.results ?? [];
+  } catch (error) {
+    console.warn("webhook_events unavailable (run migrations)", error);
+  }
+
+  return c.json({ logs: rows.results ?? [], events });
 });
 
 app.post("/admin/api/comments/:commentId/retry", async (c) => {
@@ -903,6 +1109,14 @@ async function scheduled(
           else console.log("Instagram token refresh skipped:", result.reason);
         })
         .catch((error) => console.error("Instagram token refresh failed", error)),
+    );
+
+    // Keep the diagnostic log bounded.
+    tasks.push(
+      env.DB.prepare("DELETE FROM webhook_events WHERE created_at < ?")
+        .bind(new Date(Date.now() - 7 * 86_400_000).toISOString())
+        .run()
+        .catch((error) => console.error("webhook event prune failed", error)),
     );
   }
 

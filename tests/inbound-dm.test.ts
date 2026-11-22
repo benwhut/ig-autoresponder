@@ -1,17 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { connectToken } from "../src/meta";
+import { drainQueue, enqueueJob } from "../src/queue";
 import {
+  ACCOUNT_ID,
+  APP_SECRET,
   FACEBOOK_ACCOUNT_ID,
   FACEBOOK_TOKEN,
+  adminRequest,
   createTestContext,
   getExecution,
   getJob,
   insertRule,
   installMetaMock,
   jsonResponse,
+  login,
   sendComment,
   sendMessage,
+  signedWebhookRequest,
   type MetaMock,
   type TestContext,
 } from "./helpers";
@@ -157,5 +163,212 @@ describe("inbound DM opt-in matching", () => {
       senderId: "igsid_log",
       matchedSessionId: "comment_log",
     });
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Alternate webhook shapes (Facebook Graph / Page-linked Instagram)   */
+/* ------------------------------------------------------------------ */
+
+async function sendRawWebhook(ctx: TestContext, payload: unknown): Promise<Response> {
+  const request = await signedWebhookRequest(APP_SECRET, payload);
+  const response = await ctx.dispatch(request);
+  await ctx.settle();
+  return response;
+}
+
+function changesMessagePayload(options: {
+  senderId?: string;
+  text?: string;
+  field?: string;
+  nested?: boolean;
+}): Record<string, unknown> {
+  const event = {
+    sender: { id: options.senderId ?? "igsid_sender" },
+    recipient: { id: FACEBOOK_ACCOUNT_ID },
+    message: { mid: "mid_yes", text: options.text ?? "YES" },
+  };
+
+  return {
+    object: "instagram",
+    entry: [
+      {
+        id: FACEBOOK_ACCOUNT_ID,
+        time: Math.floor(Date.now() / 1000),
+        changes: [
+          {
+            field: options.field ?? "messages",
+            value: options.nested ? { value: event } : event,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+describe("alternate inbound DM webhook shapes", () => {
+  it("handles entry[].changes[] with field = messages", async () => {
+    meta = mockPrivateReplyRecipient("igsid_sender");
+    await insertRule(ctx, { keywords: ["link"] });
+
+    await sendComment(ctx, { commentId: "comment_changes", text: "link", fromId: "commenter_a" });
+    expect((await getExecution(ctx, "comment_changes"))?.state).toBe("awaiting_opt_in");
+
+    const response = await sendRawWebhook(ctx, changesMessagePayload({ senderId: "igsid_sender" }));
+    expect(response.status).toBe(200);
+
+    expect((await getExecution(ctx, "comment_changes"))?.state).toBe("completed");
+    expect((await getJob(ctx, "comment_changes", "followup_dm"))?.status).toBe("done");
+
+    const messages = meta.callsTo("/messages");
+    expect(messages).toHaveLength(2);
+    expect(messages[1]?.body).toMatchObject({ recipient: { id: "igsid_sender" } });
+  });
+
+  it("handles a changes value nested one level deeper", async () => {
+    meta = mockPrivateReplyRecipient("igsid_nested");
+    await insertRule(ctx, { keywords: ["link"] });
+
+    await sendComment(ctx, { commentId: "comment_nested", text: "link", fromId: "commenter_b" });
+    await sendRawWebhook(
+      ctx,
+      changesMessagePayload({ senderId: "igsid_nested", nested: true }),
+    );
+
+    expect((await getExecution(ctx, "comment_nested"))?.state).toBe("completed");
+  });
+
+  it("handles object = page with entry[].messaging[]", async () => {    meta = mockPrivateReplyRecipient("igsid_page");
+    await insertRule(ctx, { keywords: ["link"] });
+
+    await sendComment(ctx, { commentId: "comment_page", text: "link", fromId: "commenter_c" });
+
+    await sendRawWebhook(ctx, {
+      object: "page",
+      entry: [
+        {
+          id: "page_123",
+          time: Math.floor(Date.now() / 1000),
+          messaging: [
+            {
+              sender: { id: "igsid_page" },
+              recipient: { id: FACEBOOK_ACCOUNT_ID },
+              message: { mid: "mid_page", text: "YES" },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect((await getExecution(ctx, "comment_page"))?.state).toBe("completed");
+  });
+
+  it("handles a flat sender_id/recipient_id/message payload", async () => {
+    meta = mockPrivateReplyRecipient("igsid_flat");
+    await insertRule(ctx, { keywords: ["link"] });
+
+    await sendComment(ctx, { commentId: "comment_flat", text: "link", fromId: "commenter_e" });
+
+    await sendRawWebhook(ctx, {
+      object: "instagram",
+      entry: [
+        {
+          id: FACEBOOK_ACCOUNT_ID,
+          time: Math.floor(Date.now() / 1000),
+          changes: [
+            {
+              field: "messages",
+              value: {
+                sender_id: "igsid_flat",
+                recipient_id: FACEBOOK_ACCOUNT_ID,
+                message: "YES",
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect((await getExecution(ctx, "comment_flat"))?.state).toBe("completed");
+  });
+
+  it("records webhook diagnostics for /admin/api/logs", async () => {
+    meta = mockPrivateReplyRecipient("igsid_diag");
+    await insertRule(ctx, { keywords: ["link"] });
+
+    await sendComment(ctx, { commentId: "comment_diag", text: "link", fromId: "commenter_d" });
+    await sendRawWebhook(ctx, changesMessagePayload({ senderId: "igsid_diag" }));
+
+    const cookie = await login(ctx);
+    const response = await adminRequest(ctx, "/admin/api/logs?include_ignored=1", { cookie });
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as {
+      logs: Array<Record<string, unknown>>;
+      events: Array<Record<string, unknown>>;
+    };
+
+    expect(body.events.length).toBeGreaterThan(0);
+    expect(body.events.some((event) => event.kind === "received")).toBe(true);
+    expect(
+      body.events.some(
+        (event) =>
+          event.kind === "dm" &&
+          typeof event.reason === "string" &&
+          event.reason.startsWith("matched"),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("cron drain path", () => {
+  it("stores recipient_id when the cron drain (not the webhook) sends Step 1", async () => {
+    meta = mockPrivateReplyRecipient("igsid_cron");
+    const rule = await insertRule(ctx, { keywords: ["link"] });
+    const now = new Date().toISOString();
+
+    await ctx.env.DB.prepare(
+      `INSERT INTO comment_executions
+         (comment_id, media_id, commenter_igsid, commenter_username, comment_text, rule_id, state,
+          private_reply_sent_at, opt_in_completed_at, public_reply_status, last_error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'matched_queued', NULL, NULL, 'none', NULL, ?, ?)`,
+    )
+      .bind("comment_cron", "media_1", "commenter_cron", "cronfan", "link", rule.id, now, now)
+      .run();
+
+    await enqueueJob(ctx.env, {
+      jobType: "private_reply",
+      commentId: "comment_cron",
+      payload: {
+        text: rule.initial_dm_text,
+        delivery_mode: "two_step_opt_in",
+        rule_id: rule.id,
+      },
+    });
+
+    const stats = await drainQueue(ctx.env);
+    expect(stats.sent).toBe(1);
+
+    const execution = await getExecution(ctx, "comment_cron");
+    expect(execution?.state).toBe("awaiting_opt_in");
+    expect(execution?.recipient_igsid).toBe("igsid_cron");
+
+    // A second drain must not resend.
+    const second = await drainQueue(ctx.env);
+    expect(second.claimed).toBe(0);
+    expect(meta.callsTo("/messages")).toHaveLength(1);
+  });
+});
+
+describe("signature failures", () => {
+  it("logs and rejects a webhook with a bad signature", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const request = await signedWebhookRequest("wrong-secret", changesMessagePayload({}));
+    const response = await ctx.dispatch(request);
+
+    expect(response.status).toBe(401);
+    expect(
+      errorLog.mock.calls.some((call) => call[0] === "webhook signature verification failed"),
+    ).toBe(true);
   });
 });

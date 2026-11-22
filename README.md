@@ -40,7 +40,8 @@ No Facebook Page is required for the Instagram Login (`IGAA…`) flow; Meta Busi
 ├── .dev.vars.example
 ├── migrations/
 │   ├── 0001_init.sql
-│   └── 0002_recipient_igsid.sql
+│   ├── 0002_recipient_igsid.sql
+│   └── 0003_webhook_events.sql
 ├── src/
 │   ├── index.ts          # HTTP router, webhook, admin API, scheduled handler
 │   ├── meta.ts           # HMAC, Graph API client, AES-GCM token storage, refresh
@@ -54,6 +55,7 @@ No Facebook Page is required for the Instagram Login (`IGAA…`) flow; Meta Busi
 │   ├── matcher.test.ts
 │   ├── flow.test.ts
 │   ├── meta.test.ts
+│   ├── inbound-dm.test.ts
 │   ├── auth.test.ts
 │   ├── ui.test.ts
 │   ├── helpers.ts
@@ -123,7 +125,7 @@ migrations_dir = "migrations"
 npx wrangler d1 migrations apply DB --remote
 ```
 
-(Applies every file in `migrations/` in order, including `0002_recipient_igsid.sql`, which adds the `recipient_igsid` column used by the opt-in handshake.)
+(Applies every file in `migrations/` in order, including `0002_recipient_igsid.sql` (opt-in recipient id) and `0003_webhook_events.sql` (webhook diagnostics).)
 
 ### Set secrets
 
@@ -204,7 +206,20 @@ curl -i -X POST http://localhost:8787/webhook \
   --data "$BODY"
 ```
 
-A valid request returns `EVENT_RECEIVED`. A bad signature returns `401`.
+A valid request returns `EVENT_RECEIVED`. A bad signature returns `401` and logs `webhook signature verification failed`.
+
+### Webhook payload shapes
+
+Meta delivers Instagram DMs in two shapes; the Worker normalises both into one handler:
+
+| Shape | Typical source | Event object |
+| --- | --- | --- |
+| `entry[].messaging[]` | Instagram Login, some Page-linked deliveries | `{ sender, recipient, message }` |
+| `entry[].changes[]` with `field: "messages"` | Facebook Graph / Page-linked Instagram | `{ value: { sender, recipient, message } }` |
+
+`object` may be `"instagram"` or `"page"`. Comments continue to arrive as `entry[].changes[]` with `field: "comments"`.
+
+Every delivery logs `webhook received <json>` and each DM decision logs `inbound dm { senderId, recipientId, text, matchedSessionId, reason, source, entryId }`. Recent payloads and decisions are stored in `webhook_events` and returned by `GET /admin/api/logs` as `events` (last 50, pruned after 7 days), so you can inspect them without `wrangler tail`.
 
 ---
 
@@ -366,12 +381,14 @@ npm run db:migrate:local # apply schema to local D1
 npm run db:migrate:remote
 ```
 
-The test suite uses Node's built-in SQLite through a small D1 adapter, so it exercises real SQL (`ON CONFLICT`, `RETURNING`, batches) without downloading a Workers runtime. 79 tests cover:
+The test suite uses Node's built-in SQLite through a small D1 adapter, so it exercises real SQL (`ON CONFLICT`, `RETURNING`, batches) without downloading a Workers runtime. 86 tests cover:
 
 - HMAC signature verification, handshake, echo filtering, duplicate comment idempotency
 - whole-word/phrase keyword matching, post-specific vs. global precedence, priority ordering
 - two-step opt-in transitions, opt-in keywords, 24-hour window, duplicate DM suppression
 - private-reply `recipient_id` capture, inbound DM matching on either id, structured skip/match logs
+- both DM webhook shapes (`entry[].messaging[]` and `entry[].changes[]` with `field: "messages"`), `object: "page"` deliveries
+- cron-drain Step 1 capture, `/admin/api/logs` webhook events, signature-failure logging
 - direct-link mode, public reply variants, retry/backoff, permanent-error handling
 - login throttling, session tampering, CSRF guard, token encryption at rest, media sync
 - EAA token resolution (`/me/assigned_instagram_accounts`, `/me/accounts` fallback), `/{ig_user_id}/messages` routing, non-expiring System User tokens
@@ -387,6 +404,8 @@ The test suite uses Node's built-in SQLite through a small D1 adapter, so it exe
 | `POST /webhook` returns 401 | Wrong `IG_APP_SECRET` (use the **Instagram App Secret**), or a proxy changed the body |
 | No webhook events | Subscribe to `comments` and `messages`; app must be Live or the account added as an Instagram tester; account must be professional |
 | No DMs sent | Check Activity → error. Common: token missing/expired, private reply already used, comment older than 7 days, 24-hour window closed |
+| Step 1 arrives but replying “YES” does nothing | Check `wrangler tail` for `inbound dm`. `reason: "no_pending_opt_in"` means the reply did not match the 24-hour session; `reason: "no_text"`/`"echo"` means Meta sent a non-text or echo event. Recent payloads are in `GET /admin/api/logs` under `events` (run migration `0003`) |
+| `/admin/api/logs` has no `events` | Apply `npx wrangler d1 migrations apply DB --remote` for `0003_webhook_events.sql` |
 | Links are not clickable | Expected for the first DM to non-followers. Use two-step opt-in |
 | Token refresh returns 400 | Token is less than 24 hours old, already refreshed, or invalid. Paste a new token |
 | “Business/System User tokens do not support refresh” | Expected for EAA tokens. Manage them in Meta Business Suite; the Worker does not refresh them |

@@ -148,6 +148,20 @@ export interface OutboundJobRow {
   updated_at: string;
 }
 
+/** Diagnostic row written for every incoming webhook branch. */
+export interface WebhookEventRow {
+  id: string;
+  object: string | null;
+  entry_id: string | null;
+  kind: string;
+  sender_id: string | null;
+  recipient_id: string | null;
+  text: string | null;
+  reason: string | null;
+  payload_json: string | null;
+  created_at: string;
+}
+
 /* ------------------------------------------------------------------ */
 /* Job payloads                                                        */
 /* ------------------------------------------------------------------ */

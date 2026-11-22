@@ -160,7 +160,7 @@ async function processJob(
         throw new GraphApiError("Comment execution row is missing", { status: 400 });
       }
 
-      const { recipientId } = await sendPrivateReply(
+      const { recipientId, messageId } = await sendPrivateReply(
         env,
         token,
         igUserId,
@@ -175,6 +175,14 @@ async function processJob(
 
       const deliveryMode: DeliveryMode =
         privatePayload.delivery_mode === "direct_link" ? "direct_link" : "two_step_opt_in";
+
+      console.log("private reply sent", {
+        commentId: job.comment_id,
+        messageId,
+        recipientId,
+        optInRecipient,
+        deliveryMode,
+      });
 
       if (deliveryMode === "two_step_opt_in") {
         await env.DB.batch([
@@ -249,6 +257,15 @@ async function processJob(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const retryable = error instanceof GraphApiError ? error.retryable : true;
+
+    console.error("outbound job failed", {
+      jobType: job.job_type,
+      commentId: job.comment_id,
+      attempts: job.attempts,
+      max_attempts: job.max_attempts,
+      retryable,
+      error: message,
+    });
 
     if (retryable && job.attempts < job.max_attempts) {
       await retryJob(env, job, now, message);
